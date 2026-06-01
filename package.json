@@ -1,0 +1,26 @@
+{
+  "name": "com.glenmorgan.pulsedeck",
+  "version": "1.0.0",
+  "description": "PulseDeck – Monitor HTTP health check endpoints from your Stream Deck",
+  "private": true,
+  "scripts": {
+    "build": "rollup -c rollup.config.mjs",
+    "watch": "rollup -c rollup.config.mjs --watch",
+    "build:dev": "rollup -c rollup.config.mjs --sourcemap",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@elgato/streamdeck": "^2.1.0"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^25.0.8",
+    "@rollup/plugin-node-resolve": "^15.3.1",
+    "@rollup/plugin-typescript": "^11.1.6",
+    "@types/node": "^25.9.1",
+    "rollup": "^4.60.4",
+    "tslib": "^2.8.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.7"
+  }
+}

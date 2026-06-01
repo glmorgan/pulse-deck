@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+  "Name": "PulseDeck",
+  "Version": "1.0.0",
+  "Author": "Glen Morgan",
+  "Actions": [
+    {
+      "Name": "Health Check",
+      "UUID": "com.glenmorgan.pulsedeck.healthcheck",
+      "Icon": "imgs/actions/healthcheck/action",
+      "Tooltip": "Monitor an HTTP health check endpoint. Press to check now, long-press for history.",
+      "Controllers": ["Keypad"],
+      "States": [
+        {
+          "Image": "imgs/actions/healthcheck/action",
+          "Name": "Default",
+          "FontSize": 10
+        }
+      ],
+      "PropertyInspectorPath": "ui/index.html",
+      "DisableAutomaticIdentifiers": false,
+      "SupportedInMultiActions": false
+    }
+  ],
+  "Category": "PulseDeck",
+  "CategoryIcon": "imgs/plugin/category",
+  "CodePath": "plugin.js",
+  "Description": "Monitor HTTP health check endpoints directly from your Stream Deck. Press a key for an instant check; long-press to see recent history.",
+  "Icon": "imgs/plugin/marketplace",
+  "SDKVersion": 2,
+  "Software": {
+    "MinimumVersion": "6.4"
+  },
+  "OS": [
+    {
+      "Platform": "mac",
+      "MinimumVersion": "10.15"
+    },
+    {
+      "Platform": "windows",
+      "MinimumVersion": "10"
+    }
+  ],
+  "Nodejs": {
+    "Version": "20",
+    "Debug": "enabled"
+  }
+}

@@ -1,0 +1,100 @@
+<!doctype html>
+<html>
+
+<head lang="en">
+  <meta charset="utf-8" />
+  <script src="sdpi-components.js"></script>
+</head>
+
+<body>
+
+  <!-- ── Service ────────────────────────────────────────────────────────── -->
+
+  <sdpi-item label="Name">
+    <sdpi-textfield
+      setting="serviceName"
+      placeholder="e.g. Orders API"
+      maxlength="60"
+    ></sdpi-textfield>
+  </sdpi-item>
+
+  <sdpi-item label="URL">
+    <sdpi-textfield
+      setting="endpointUrl"
+      placeholder="https://api.example.com/health"
+    ></sdpi-textfield>
+  </sdpi-item>
+
+  <!-- ── Check Settings ──────────────────────────────────────────────────── -->
+
+  <sdpi-item label="Frequency">
+    <sdpi-select setting="checkFrequency">
+      <option value="manual">Manual only</option>
+      <option value="1m">Every 1 minute</option>
+      <option value="10m">Every 10 minutes</option>
+      <option value="30m">Every 30 minutes</option>
+      <option value="1h">Every 1 hour</option>
+    </sdpi-select>
+  </sdpi-item>
+
+  <sdpi-item label="Expected Status">
+    <sdpi-textfield
+      setting="expectedStatusCode"
+      placeholder="200"
+      pattern="[1-5][0-9]{2}"
+    ></sdpi-textfield>
+  </sdpi-item>
+
+  <sdpi-item label="Timeout (ms)">
+    <sdpi-textfield
+      setting="timeoutMs"
+      placeholder="5000"
+      pattern="[0-9]+"
+    ></sdpi-textfield>
+  </sdpi-item>
+
+  <sdpi-item label="Slow Threshold (ms)">
+    <sdpi-textfield
+      setting="slowThresholdMs"
+      placeholder="1000"
+      pattern="[0-9]+"
+    ></sdpi-textfield>
+  </sdpi-item>
+
+  <!-- ── Failure Rules ────────────────────────────────────────────────────── -->
+
+  <sdpi-item label="Amber after (failures)">
+    <sdpi-textfield
+      setting="amberAfterFailures"
+      placeholder="1"
+      pattern="[0-9]+"
+    ></sdpi-textfield>
+  </sdpi-item>
+
+  <sdpi-item label="Red after (failures)">
+    <sdpi-textfield
+      setting="redAfterFailures"
+      placeholder="3"
+      pattern="[0-9]+"
+    ></sdpi-textfield>
+  </sdpi-item>
+
+  <!-- ── Optional Body Check ─────────────────────────────────────────────── -->
+
+  <sdpi-item label="Body Contains">
+    <sdpi-textfield
+      setting="expectedBodyContains"
+      placeholder='e.g. healthy (optional)'
+    ></sdpi-textfield>
+  </sdpi-item>
+
+  <sdpi-item label="Body Snippet in History">
+    <sdpi-checkbox
+      setting="showBodySnippetInHistory"
+      label="Store body snippet in history"
+    ></sdpi-checkbox>
+  </sdpi-item>
+
+</body>
+
+</html>

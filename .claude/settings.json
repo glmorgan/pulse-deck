@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(npm show *)",
+      "Bash(npm run *)",
+      "Read(//Users/glen/Documents/GitHub/quick-clips/com.quickclips.streamdeck.sdPlugin/ui/**)",
+      "Bash(find /Users/glen/Documents/GitHub/quick-clips -name \"sdpi-components.js\" | head -3)",
+      "Read(//Users/glen/Documents/GitHub/quick-clips/**)",
+      "Bash(cp /Users/glen/Documents/GitHub/quick-clips/com.quickclips.streamdeck.sdPlugin/ui/sdpi-components.js \\\\ *)",
+      "Read(//Users/glen/Desktop/**)",
+      "Bash(cp /Users/glen/Desktop/failure.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/actions/healthcheck/failure.png)",
+      "Bash(cp /Users/glen/Desktop/failure@2x.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/actions/healthcheck/failure@2x.png)",
+      "Bash(cp /Users/glen/Desktop/loading.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/actions/healthcheck/loading.png)",
+      "Bash(cp /Users/glen/Desktop/loading@2x.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/actions/healthcheck/loading@2x.png)",
+      "Bash(cp /Users/glen/Desktop/success.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/actions/healthcheck/success.png)",
+      "Bash(cp /Users/glen/Desktop/config.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/actions/healthcheck/config.png)",
+      "Bash(cp /Users/glen/Desktop/config@2x.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/actions/healthcheck/config@2x.png)",
+      "Bash(curl -s https://schemas.elgato.com/streamdeck/plugins/manifest.json)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); states=d.get\\('definitions',{}\\).get\\('State',{}\\); print\\(json.dumps\\(states, indent=2\\)\\)\")",
+      "Bash(grep -r \"vitest\" /Users/glen/Documents/GitHub/quick-clips --include=\"*.json\" --include=\"*.ts\" --include=\"*.js\" --include=\"*.mjs\" ! -path \"*/node_modules/*\")",
+      "Bash(npm test *)",
+      "Bash(cp /Users/glen/Desktop/pulse-deck.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/plugin/marketplace.png)",
+      "Bash(cp /Users/glen/Desktop/pulse-deck@2x.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/plugin/marketplace@2x.png)",
+      "Bash(sips -g pixelWidth -g pixelHeight /Users/glen/Desktop/pulse-deck.png /Users/glen/Desktop/pulse-deck@2x.png)",
+      "Bash(sips -g pixelWidth -g pixelHeight /Users/glen/Desktop/marketplace.png /Users/glen/Desktop/marketplace@2x.png)",
+      "Bash(cp /Users/glen/Desktop/marketplace.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/plugin/marketplace.png)",
+      "Bash(cp /Users/glen/Desktop/marketplace@2x.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/plugin/marketplace@2x.png)"
+    ],
+    "additionalDirectories": [
+      "/Users/glen/Documents/GitHub/quick-clips/com.quickclips.streamdeck.sdPlugin/ui"
+    ]
+  }
+}
