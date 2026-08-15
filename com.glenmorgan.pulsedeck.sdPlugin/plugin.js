@@ -8564,9 +8564,17 @@ function showPopup(content) {
     }
 }
 
-/** Thrown when a host could not display anything — try the next one, do not treat as a close. */
-class HistoryWindowLaunchError extends Error {
-}
+/**
+ * The plumbing every plugin window shares: an ephemeral loopback server, a token that gates it,
+ * a native host to display it, and the rules for when a host has failed rather than been closed.
+ *
+ * Extracted when the board window needed all of it. The alternative was a second copy, which is
+ * how the picker's host lookup came to exist in three places in quick-clips before it was pulled
+ * into one — and duplicated security code is the kind that drifts.
+ *
+ * Callers supply the page and handle their own message types; ping, close and error are handled
+ * here because they mean the same thing for any window.
+ */
 /** Bundled native host, relative to the sdPlugin root (the plugin's working directory). */
 const NATIVE_HOST = "bin/pulse-host";
 /** Chromium-family browsers that support `--app=` windows, in preference order. */
@@ -8577,8 +8585,8 @@ const BROWSER_CANDIDATES = {
         "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
     ],
-    // The native host is macOS-only and the osascript fallback does not exist on Windows, so a
-    // browser is the *only* way this feature works there — worth the four paths.
+    // The native host is macOS only and there is no osascript fallback on Windows, so a browser is
+    // the only way these windows work there.
     win32: [
         "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
         "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
@@ -8586,30 +8594,19 @@ const BROWSER_CANDIDATES = {
         "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
     ],
 };
-/** Content-area size. Wide enough for 60 columns at a readable width, tall enough for both cards. */
-const WINDOW_WIDTH = 900;
-const WINDOW_HEIGHT = 740;
-/** Fraction of leftover vertical space above the window; 0.5 is dead centre, lower sits higher. */
-const VERTICAL_BIAS = 0.35;
 /**
- * How long the window may sit *idle* before closing itself. Re-armed by interaction only: the
- * page's own polling would otherwise hold it open forever, which is how an orphan window happens.
- */
-const DEFAULT_TIMEOUT_MS = 10 * 60_000;
-/**
- * A host that never asked for the page has failed, even if its process is still alive — a binary
- * macOS refuses to run can hang rather than exit, which is indistinguishable from a slow launch
- * until you notice nothing was ever requested.
+ * A host that never asked for the page has failed, even if its process is still alive: a binary
+ * macOS refuses to run can hang rather than exit.
  */
 const PAGE_LOAD_TIMEOUT_MS = 6_000;
-/** How often the page asks for a fresh snapshot. Fast enough to feel live, cheap enough to ignore. */
-const POLL_MS = 2_000;
+/** Thrown when a host could not display anything — try the next one, do not treat as a close. */
+class WindowLaunchError extends Error {
+}
 /**
- * Returns every command capable of showing the window, best first.
+ * Returns every command capable of showing a window, best first.
  *
- * All of them rather than the best one, because a host can be present yet unlaunchable — an
- * unsigned native host that Gatekeeper quarantined is the usual case — and the caller works down
- * the list before giving up on the window entirely.
+ * All of them rather than the best one, because a host can be present yet unlaunchable — a
+ * quarantined unsigned binary is the usual case — so callers work down the list.
  */
 async function findHosts() {
     const hosts = [];
@@ -8618,9 +8615,8 @@ async function findHosts() {
         hosts.push(NATIVE_HOST);
     }
     catch {
-        // `streamdeck pack` stores no permission bits, so the host arrives from a packaged install
-        // without its exec bit. plugin.js is unaffected because Stream Deck runs it as an argument
-        // to node. Repair the bit rather than falling back to a browser on every packaged install.
+        // `streamdeck pack` stores no permission bits, so a packed install's host arrives without its
+        // exec bit. plugin.js is unaffected because Stream Deck runs it as an argument to node.
         try {
             await promises.access(NATIVE_HOST, fs.constants.F_OK);
             await promises.chmod(NATIVE_HOST, 0o755);
@@ -8643,14 +8639,186 @@ async function findHosts() {
     return hosts;
 }
 /**
+ * Serves a window and resolves when it closes.
+ *
+ * @param hostPath Executable from {@link findHosts}. Spawned directly rather than through `open`,
+ * because `open -a` drops `--args` when the browser is already running, which would surface the
+ * page as an ordinary tab instead of an app window.
+ */
+async function serveWindow(hostPath, options) {
+    const token = node_crypto.randomBytes(16).toString("hex");
+    const warn = options.onWarn ?? (() => { });
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let child;
+        let idleTimer;
+        let loadWatchdog;
+        let pageServed = false;
+        const server = node_http.createServer(handle);
+        function stop() {
+            if (idleTimer)
+                clearTimeout(idleTimer);
+            if (loadWatchdog)
+                clearTimeout(loadWatchdog);
+            server.close();
+            // The window owns nothing else, so terminating the host is safe.
+            child?.kill();
+        }
+        function finish() {
+            if (settled)
+                return;
+            settled = true;
+            stop();
+            resolve();
+        }
+        /** A host that never displayed anything — the caller should try the next one. */
+        function failLaunch(detail) {
+            if (settled)
+                return;
+            settled = true;
+            stop();
+            reject(new WindowLaunchError(`${hostPath} failed to launch: ${detail}`));
+        }
+        function armIdleTimer() {
+            if (settled)
+                return;
+            if (idleTimer)
+                clearTimeout(idleTimer);
+            idleTimer = setTimeout(finish, options.timeoutMs);
+        }
+        function sendJson(res, payload) {
+            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(payload ?? {}));
+        }
+        function handle(req, res) {
+            const url = new URL(req.url ?? "/", "http://127.0.0.1");
+            // Any local process can reach this port, so the token gates every route before any routing.
+            if (url.searchParams.get("t") !== token) {
+                res.writeHead(403).end("forbidden");
+                return;
+            }
+            if (url.pathname === "/") {
+                pageServed = true;
+                if (loadWatchdog)
+                    clearTimeout(loadWatchdog);
+                res.writeHead(200, {
+                    "Content-Type": "text/html; charset=utf-8",
+                    "Cache-Control": "no-store, no-cache, must-revalidate",
+                }).end(options.renderPage(token));
+                return;
+            }
+            const extra = options.renderRoute?.(url.pathname, url.searchParams);
+            if (typeof extra === "string") {
+                res.writeHead(200, {
+                    "Content-Type": "text/html; charset=utf-8",
+                    "Cache-Control": "no-store, no-cache, must-revalidate",
+                }).end(extra);
+                return;
+            }
+            if (url.pathname === "/message" && req.method === "POST") {
+                let body = "";
+                req.on("data", (chunk) => { body += chunk; });
+                req.on("end", () => {
+                    let parsed;
+                    try {
+                        parsed = JSON.parse(body);
+                    }
+                    catch {
+                        sendJson(res, {});
+                        return;
+                    }
+                    if (parsed.type === "ping") {
+                        armIdleTimer();
+                        sendJson(res, {});
+                        return;
+                    }
+                    if (parsed.type === "error" && typeof parsed.message === "string") {
+                        warn(`window page error: ${parsed.message}`);
+                        sendJson(res, {});
+                        return;
+                    }
+                    if (parsed.type === "close") {
+                        sendJson(res, {});
+                        finish();
+                        return;
+                    }
+                    const handler = options.onMessage;
+                    if (!handler) {
+                        sendJson(res, {});
+                        return;
+                    }
+                    Promise.resolve()
+                        .then(() => handler(parsed))
+                        .then((reply) => sendJson(res, reply))
+                        .catch((error) => {
+                        const message = error instanceof Error ? error.message : "Failed";
+                        warn(`window message "${String(parsed.type)}" failed: ${message}`);
+                        sendJson(res, { message });
+                    });
+                });
+                return;
+            }
+            res.writeHead(404).end("not found");
+        }
+        server.on("error", (error) => failLaunch(error.message));
+        server.listen(0, "127.0.0.1", () => {
+            const { port } = server.address();
+            const target = `http://127.0.0.1:${port}/?t=${token}`;
+            // Chrome's own flag spelling, which the native host also accepts, so the two are
+            // interchangeable and nothing here needs to know which one it spawned.
+            child = node_child_process.spawn(hostPath, [
+                `--app=${target}`,
+                `--window-size=${options.width},${options.height}`,
+                "--no-first-run",
+                "--no-default-browser-check",
+            ], { stdio: ["ignore", "ignore", "pipe"], detached: false });
+            child.stderr?.on("data", (chunk) => {
+                const text = String(chunk).trim();
+                if (text)
+                    warn(text);
+            });
+            child.on("error", (error) => failLaunch(error.message));
+            // Exit status separates the two reasons a host can be gone: code 0 means it ran and the
+            // window was closed (the page's own close message usually beats this, but it can lose the
+            // race); anything else means it never displayed, and the next host is worth trying.
+            child.on("exit", (code, signal) => {
+                if (settled)
+                    return;
+                if (code === 0 && !signal)
+                    finish();
+                else
+                    failLaunch(signal ? `killed by ${signal}` : `exited with code ${code}`);
+            });
+            options.onOpen?.(finish);
+            armIdleTimer();
+            loadWatchdog = setTimeout(() => {
+                if (!pageServed)
+                    failLaunch(`never requested the page within ${PAGE_LOAD_TIMEOUT_MS}ms`);
+            }, PAGE_LOAD_TIMEOUT_MS);
+        });
+    });
+}
+
+/** Content-area size. Wide enough for 60 columns at a readable width, tall enough for both cards. */
+const WINDOW_WIDTH$1 = 900;
+const WINDOW_HEIGHT$1 = 740;
+/** Fraction of leftover vertical space above the window; 0.5 is dead centre, lower sits higher. */
+const VERTICAL_BIAS$1 = 0.35;
+/**
+ * How long the window may sit *idle* before closing itself. Re-armed by interaction only: the
+ * page's own polling would otherwise hold it open forever, which is how an orphan window happens.
+ */
+const DEFAULT_TIMEOUT_MS$1 = 10 * 60_000;
+/** How often the page asks for a fresh snapshot. Fast enough to feel live, cheap enough to ignore. */
+const POLL_MS$1 = 2_000;
+/**
  * Serialises data for a `<script>` block. `<` must be escaped or a `</script>` inside a body
  * snippet or an error message would end the block early.
  */
-function embedJson(value) {
+function embedJson$1(value) {
     return JSON.stringify(value).replace(/</g, "\\u003c");
 }
 /** Escapes text for an HTML text node or attribute. */
-function escapeHtml(text) {
+function escapeHtml$1(text) {
     return text
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
@@ -8666,7 +8834,7 @@ function escapeHtml(text) {
  * `currentColor` lets it take the button's own ink — the page background on the accent fill, the
  * muted grey while disabled.
  */
-const REFRESH_SVG = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"`
+const REFRESH_SVG$1 = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"`
     + ` stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
     + `<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>`
     + `<path d="M21 3v5h-5"/>`
@@ -8685,14 +8853,20 @@ const REFRESH_SVG = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none"
  * it reaches the DOM through `textContent` rather than markup.
  */
 function renderHistoryHtml(snapshot, token, options) {
-    const winW = options.width ?? WINDOW_WIDTH;
-    const winH = options.height ?? WINDOW_HEIGHT;
-    const pollMs = options.pollMs ?? POLL_MS;
+    const winW = options.width ?? WINDOW_WIDTH$1;
+    const winH = options.height ?? WINDOW_HEIGHT$1;
+    const pollMs = options.pollMs ?? POLL_MS$1;
     return `<!doctype html>
-<html lang="en">
+<html lang="en" style="background:#333333">
 <head>
 <meta charset="utf-8" />
-<title>${escapeHtml(snapshot.serviceName)} — PulseDeck</title>
+<!--
+  Declared here as well as in the stylesheet: a fresh document paints its base canvas before any
+  CSS is applied, which showed as a white flash each time the board swapped one service's frame
+  for another. The inline background and the colour-scheme hint both land at parse time.
+-->
+<meta name="color-scheme" content="dark" />
+<title>${escapeHtml$1(snapshot.serviceName)} — PulseDeck</title>
 <script>
 /*
  * Runs before the body is parsed, so a browser window is sized and placed ahead of first paint.
@@ -8704,6 +8878,7 @@ function renderHistoryHtml(snapshot, token, options) {
  */
 (function () {
   var W = ${winW}, H = ${winH};
+  var EMBEDDED = ${options.embedded ? "true" : "false"};
   var root = document.documentElement;
   var revealed = false;
   function reveal() {
@@ -8713,7 +8888,9 @@ function renderHistoryHtml(snapshot, token, options) {
   }
   // The native host creates the window already sized and placed, and resizeTo() there would size
   // the *outer* frame and cost the content the height of the title bar.
-  if (window.__nativeHost) { reveal(); return; }
+  // An embedded page is a frame inside someone else's window: there is nothing to size, and
+  // resizeTo would either be ignored or, worse, resize the host window around it.
+  if (window.__nativeHost || EMBEDDED) { reveal(); return; }
   try {
     var chromeW = Math.max(0, window.outerWidth - window.innerWidth);
     var chromeH = Math.max(0, window.outerHeight - window.innerHeight);
@@ -8723,7 +8900,7 @@ function renderHistoryHtml(snapshot, token, options) {
     // that monitor rather than assuming the primary one.
     window.moveTo(
       Math.round((screen.availWidth - outerW) / 2) + (screen.availLeft || 0),
-      Math.round((screen.availHeight - outerH) * ${VERTICAL_BIAS}) + (screen.availTop || 0)
+      Math.round((screen.availHeight - outerH) * ${VERTICAL_BIAS$1}) + (screen.availTop || 0)
     );
   } catch (e) {
     reveal();
@@ -9004,10 +9181,22 @@ function renderHistoryHtml(snapshot, token, options) {
     display: inline-grid; place-items: center; min-width: 17px; height: 17px; padding: 0 4px;
     background: var(--kbd); border-radius: 4px; font: inherit; font-size: 10px; color: var(--fg-dim);
   }
+${options.embedded ? `
+  /*
+   * Embedded, the host window owns the margins.
+   *
+   * These gutters exist so the page has breathing room against a window edge; inside a pane that
+   * already has its own padding they are a second inset, and the tiles and chart sat short of the
+   * heading above them and the button to their right. The frame is given the width it should
+   * fill, so the page fills it.
+   */
+  .wrap { padding: 0; max-width: none; }
+  main { padding: 0; }
+` : ""}
 </style>
 </head>
 <body>
-<header>
+${options.embedded ? "" : `<header>
   <div class="wrap">
     <div class="id">
       <span class="pill" id="pill"><span class="dot"></span><span id="pill-label"></span></span>
@@ -9015,10 +9204,10 @@ function renderHistoryHtml(snapshot, token, options) {
       <p class="meta" id="meta"></p>
     </div>
     ${options.canCheck
-        ? `<button id="check">${REFRESH_SVG}<span id="check-label">Check now</span></button>`
+        ? `<button id="check">${REFRESH_SVG$1}<span id="check-label">Check now</span></button>`
         : ""}
   </div>
-</header>
+</header>`}
 
 <main class="wrap">
 <section class="tiles" id="tiles"></section>
@@ -9067,7 +9256,7 @@ function renderHistoryHtml(snapshot, token, options) {
 </section>
 </main>
 
-<footer>
+${options.embedded ? "" : `<footer>
   <div class="wrap">
     <span id="foot"></span>
     <span class="keys">
@@ -9075,15 +9264,18 @@ function renderHistoryHtml(snapshot, token, options) {
       <span><kbd>esc</kbd> close</span>
     </span>
   </div>
-</footer>
+</footer>`}
 
 <script>
 (function () {
   'use strict';
-  var TOKEN = ${embedJson(token)};
+  var TOKEN = ${embedJson$1(token)};
   var POLL_MS = ${pollMs};
   var CAN_CHECK = ${options.canCheck ? "true" : "false"};
-  var data = ${embedJson(snapshot)};
+  var EMBEDDED = ${options.embedded ? "true" : "false"};
+  /** Sent with every message so a board knows which service is asking. */
+  var SCOPE = ${embedJson$1(options.scope ?? null)};
+  var data = ${embedJson$1(snapshot)};
 
   /* Report page-side failures to the plugin log; a broken render is otherwise silent. */
   window.addEventListener('error', function (e) {
@@ -9092,6 +9284,7 @@ function renderHistoryHtml(snapshot, token, options) {
 
   function post(type, extra) {
     var body = { type: type };
+    if (SCOPE !== null) body.scope = SCOPE;
     if (extra) for (var k in extra) body[k] = extra[k];
     return fetch('/message?t=' + encodeURIComponent(TOKEN), {
       method: 'POST',
@@ -9155,6 +9348,8 @@ function renderHistoryHtml(snapshot, token, options) {
   /* ── header, tiles, table ────────────────────────────────────────────── */
 
   function paintHeader() {
+    // Embedded, the board owns the header and the footer; there is nothing here to paint.
+    if (EMBEDDED) return;
     document.getElementById('name').textContent = data.serviceName;
     var pill = document.getElementById('pill');
     pill.setAttribute('data-state', data.state);
@@ -9695,7 +9890,9 @@ function renderHistoryHtml(snapshot, token, options) {
   }
 
   document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') { post('close'); window.close(); return; }
+    // Embedded, closing is the host window's business: this page's Escape would otherwise
+    // shut the whole board.
+    if (e.key === 'Escape' && !EMBEDDED) { post('close'); window.close(); return; }
     if ((e.key === 'r' || e.key === 'R') && !e.metaKey && !e.ctrlKey) runCheck();
   });
 
@@ -9721,7 +9918,11 @@ function renderHistoryHtml(snapshot, token, options) {
   document.addEventListener('pointerdown', touch, true);
   document.addEventListener('wheel', touch, true);
 
-  window.addEventListener('beforeunload', function () { post('close'); });
+  // Same reasoning: an embedded frame unloads whenever the selection changes, which must not
+  // be reported as the window closing.
+  if (!EMBEDDED) {
+    window.addEventListener('beforeunload', function () { post('close'); });
+  }
   window.addEventListener('resize', function () { paintChart(); });
 
   paint();
@@ -9733,176 +9934,41 @@ function renderHistoryHtml(snapshot, token, options) {
 /**
  * Shows the history window and resolves when it closes.
  *
- * @param hostPath Executable from {@link findHosts}. Spawned directly rather than through `open`,
- * because `open -a` drops `--args` when the browser is already running, which would surface this
- * as an ordinary tab instead of an app window.
+ * The server, the token gate, the host spawn and the launch/close distinction all live in
+ * `windowHost`; what is left here is the page and the two messages this window has of its own.
  */
 async function showHistoryWindow(hostPath, options) {
-    const token = node_crypto.randomBytes(16).toString("hex");
-    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const warn = options.onWarn ?? (() => { });
-    const width = options.width ?? WINDOW_WIDTH;
-    const height = options.height ?? WINDOW_HEIGHT;
-    return new Promise((resolve, reject) => {
-        let settled = false;
-        let child;
-        let idleTimer;
-        let loadWatchdog;
-        let pageServed = false;
-        const server = node_http.createServer(handle);
-        function finish() {
-            if (settled)
-                return;
-            settled = true;
-            if (idleTimer)
-                clearTimeout(idleTimer);
-            if (loadWatchdog)
-                clearTimeout(loadWatchdog);
-            server.close();
-            // The window owns nothing else, so terminating the host is safe.
-            child?.kill();
-            resolve();
-        }
-        /** A host that never displayed anything — the caller should try the next one. */
-        function failLaunch(detail) {
-            if (settled)
-                return;
-            settled = true;
-            if (idleTimer)
-                clearTimeout(idleTimer);
-            if (loadWatchdog)
-                clearTimeout(loadWatchdog);
-            server.close();
-            child?.kill();
-            reject(new HistoryWindowLaunchError(`${hostPath} failed to launch: ${detail}`));
-        }
-        function armIdleTimer() {
-            if (settled)
-                return;
-            if (idleTimer)
-                clearTimeout(idleTimer);
-            idleTimer = setTimeout(finish, timeoutMs);
-        }
-        function sendJson(res, payload) {
-            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(payload));
-        }
-        function handle(req, res) {
-            const url = new URL(req.url ?? "/", "http://127.0.0.1");
-            // Any local process can reach this port, so the token gates every route before any routing.
-            if (url.searchParams.get("t") !== token) {
-                res.writeHead(403).end("forbidden");
-                return;
-            }
-            if (url.pathname === "/") {
-                // Proof the host launched and asked for something.
-                pageServed = true;
-                if (loadWatchdog)
-                    clearTimeout(loadWatchdog);
-                res.writeHead(200, {
-                    "Content-Type": "text/html; charset=utf-8",
-                    "Cache-Control": "no-store, no-cache, must-revalidate",
-                }).end(renderHistoryHtml(options.getSnapshot(), token, {
-                    width,
-                    height,
-                    canCheck: !!options.onRunCheck,
-                }));
-                return;
-            }
-            if (url.pathname === "/message" && req.method === "POST") {
-                let body = "";
-                req.on("data", (chunk) => { body += chunk; });
-                req.on("end", () => {
-                    let parsed;
+    return serveWindow(hostPath, {
+        width: options.width ?? WINDOW_WIDTH$1,
+        height: options.height ?? WINDOW_HEIGHT$1,
+        timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS$1,
+        onWarn: options.onWarn,
+        onOpen: options.onOpen,
+        renderPage: (token) => renderHistoryHtml(options.getSnapshot(), token, {
+            width: options.width ?? WINDOW_WIDTH$1,
+            height: options.height ?? WINDOW_HEIGHT$1,
+            canCheck: !!options.onRunCheck,
+        }),
+        onMessage: async (message) => {
+            // A read, deliberately not an interaction: see the page's comment about the two clocks.
+            if (message.type === "poll")
+                return { data: options.getSnapshot() };
+            if (message.type === "check") {
+                const run = options.onRunCheck;
+                if (run) {
                     try {
-                        parsed = JSON.parse(body);
+                        await run();
                     }
-                    catch {
-                        sendJson(res, {});
-                        return;
+                    catch (error) {
+                        // The window stays up and shows whatever the key holds; a failed manual check is
+                        // already visible as the key's state.
+                        options.onWarn?.(`history window check failed: ${error instanceof Error ? error.message : String(error)}`);
                     }
-                    // A read, deliberately not an interaction: see the page's comment about the two clocks.
-                    if (parsed.type === "poll") {
-                        sendJson(res, { data: options.getSnapshot() });
-                        return;
-                    }
-                    if (parsed.type === "ping") {
-                        armIdleTimer();
-                        sendJson(res, {});
-                        return;
-                    }
-                    if (parsed.type === "check") {
-                        armIdleTimer();
-                        const run = options.onRunCheck;
-                        if (!run) {
-                            sendJson(res, { data: options.getSnapshot() });
-                            return;
-                        }
-                        run()
-                            .catch((error) => {
-                            // The window stays up and shows whatever the key holds; a failed manual check is
-                            // already visible as the key's state.
-                            warn(`history window check failed: ${error instanceof Error ? error.message : String(error)}`);
-                        })
-                            .then(() => { sendJson(res, { data: options.getSnapshot() }); });
-                        return;
-                    }
-                    if (parsed.type === "error" && typeof parsed.message === "string") {
-                        warn(`history window page error: ${parsed.message}`);
-                        sendJson(res, {});
-                        return;
-                    }
-                    if (parsed.type === "close") {
-                        sendJson(res, {});
-                        finish();
-                        return;
-                    }
-                    sendJson(res, {});
-                });
-                return;
+                }
+                return { data: options.getSnapshot() };
             }
-            res.writeHead(404).end("not found");
-        }
-        server.on("error", (error) => failLaunch(error.message));
-        server.listen(0, "127.0.0.1", () => {
-            const { port } = server.address();
-            const target = `http://127.0.0.1:${port}/?t=${token}`;
-            // Chrome's own flag spelling, which the native host also accepts, so the two are
-            // interchangeable and nothing here needs to know which one it spawned.
-            child = node_child_process.spawn(hostPath, [
-                `--app=${target}`,
-                `--window-size=${width},${height}`,
-                "--no-first-run",
-                "--no-default-browser-check",
-            ], { stdio: ["ignore", "ignore", "pipe"], detached: false });
-            // The native host reports its resolved geometry and any page-load failure on stderr.
-            // Discarding it would hide exactly the class of problem that is hardest to diagnose.
-            child.stderr?.on("data", (chunk) => {
-                const text = String(chunk).trim();
-                if (text)
-                    warn(text);
-            });
-            child.on("error", (error) => failLaunch(error.message));
-            // Exit status separates the two very different reasons a host can be gone:
-            //   code 0  — it ran and the window was closed. The page's own close message usually beats
-            //             this, but it can lose the race, and reopening another host would pop a second
-            //             window at someone who just closed one.
-            //   anything else — it never displayed: a quarantined binary killed by the system, or bad
-            //             arguments. Worth trying the next host.
-            child.on("exit", (code, signal) => {
-                if (settled)
-                    return;
-                if (code === 0 && !signal)
-                    finish();
-                else
-                    failLaunch(signal ? `killed by ${signal}` : `exited with code ${code}`);
-            });
-            options.onOpen?.(finish);
-            armIdleTimer();
-            loadWatchdog = setTimeout(() => {
-                if (!pageServed)
-                    failLaunch(`never requested the page within ${PAGE_LOAD_TIMEOUT_MS}ms`);
-            }, PAGE_LOAD_TIMEOUT_MS);
-        });
+            return {};
+        },
     });
 }
 
@@ -9981,8 +10047,8 @@ function getIcon(state) {
     return ICON_PATH[state] ?? ICON_PATH["unknown"];
 }
 
-const LONG_PRESS_MS = 500;
-const INITIAL_CHECK_DELAY_MS = 1500;
+const LONG_PRESS_MS$1 = 500;
+const INITIAL_CHECK_DELAY_MS$1 = 1500;
 let HealthCheckAction = (() => {
     let _classDecorators = [action({ UUID: "com.glenmorgan.pulsedeck.healthcheck" })];
     let _classDescriptor;
@@ -10020,7 +10086,7 @@ let HealthCheckAction = (() => {
                 : settings.currentState;
             await renderState(keyAction, initialState, settings);
             if (settings.checkFrequency !== "manual") {
-                setTimeout(() => void this.triggerCheck(id, keyAction), INITIAL_CHECK_DELAY_MS);
+                setTimeout(() => void this.triggerCheck(id, keyAction), INITIAL_CHECK_DELAY_MS$1);
             }
             this.resetTimer(id, keyAction);
         }
@@ -10065,7 +10131,7 @@ let HealthCheckAction = (() => {
                 ? Date.now() - instance.keyDownAt
                 : 0;
             instance.keyDownAt = null;
-            if (pressDuration >= LONG_PRESS_MS) {
+            if (pressDuration >= LONG_PRESS_MS$1) {
                 // Deliberately not awaited: the window stays open until it is closed, and awaiting it here
                 // would hold the key's event handler for as long as someone is reading the chart.
                 void this.openHistory(id, ev.action);
@@ -10222,5 +10288,1886 @@ function buildTitle(state, settings) {
     }
 }
 
+/**
+ * Twelve services, three across, so a full board is a 3×4.
+ *
+ * Sixteen was built and rejected. Cell area is the face divided by the count however the grid is
+ * turned, so a 4×4 cell came out around 14×14 device pixels on the key against the 3×4's 20×14,
+ * and it cost the third column that everything above depends on. Twelve is also where the window
+ * stops having to shrink a card to fit.
+ */
+const BOARD_CAPACITY = 12;
+const SIZE = 144;
+/** A board with nothing on it: there is no count to fit a grid to, so it keeps the old 3×3. */
+const EMPTY_GRID = { cols: 3, rows: 3 };
+/**
+ * Four colours, no more: green, amber, red, grey.
+ *
+ * The window distinguishes five states, but a small cell cannot. Warning and down were adjacent
+ * hues at similar lightness — orange against amber — and telling them apart at this size was
+ * guesswork, worse for anyone red/green colourblind. So a failing check is red whether or not it
+ * has passed the red threshold, and how long it has been failing is a question for the window.
+ *
+ * `checking` sits with the greys rather than getting a colour of its own: a key image is a still,
+ * and the state lasts a few hundred milliseconds.
+ */
+const CELL_FILL = {
+    healthy: "#4cc94c",
+    slow: "#fab219",
+    warning: "#d03b3b",
+    down: "#d03b3b",
+    checking: "#5a5a5a",
+    unknown: "#4a4a4a",
+    "config-error": "#4a4a4a",
+    empty: "#242424",
+};
+/** Unfilled slots read as an outline rather than a filled cell, so they are not a state. */
+const CELL_STROKE = {
+    empty: "#333333",
+};
+/** Columns and rows for a count of services, with the spacing that suits them. */
+function gridFor(count) {
+    const { cols, rows } = shapeFor(count);
+    // Four *either way*: a 3×4 is as tight as a 4×3, and at the roomier spacing the padding and the
+    // corner radius eat about a fifth of what is left to colour. Keyed off columns alone this was
+    // dead code under the old square rule, and wrong the moment the grid could be taller than wide.
+    const tight = cols >= 4 || rows >= 4;
+    return { cols, rows, pad: tight ? 8 : 10, gap: tight ? 5 : 8 };
+}
+function shapeFor(count) {
+    if (count <= 0)
+        return { ...EMPTY_GRID };
+    // Two and three are bars across the full width, not halves side by side. At key size a wide bar
+    // is the more legible shape, and it is the one that reads as "this is all of them".
+    if (count <= 3)
+        return { cols: 1, rows: count };
+    // Four is the one count that earns its own shape: three across would draw it as a row of three
+    // and a lone cell with two spares, where a 2×2 fills the face. It costs one re-lay at the fifth
+    // service, which is early enough that the board is still readable by name.
+    if (count === 4)
+        return { cols: 2, rows: 2 };
+    return { cols: 3, rows: Math.ceil(count / 3) };
+}
+/** SVG takes floats, but two decimals keeps the markup readable when something looks wrong. */
+function round2(n) {
+    return Math.round(n * 100) / 100;
+}
+function renderBoardIcon(cells) {
+    const shown = cells.slice(0, BOARD_CAPACITY);
+    const { cols, rows, pad, gap } = gridFor(shown.length);
+    // Counts that do not divide into their grid (5, 7, 10, 13) leave the remainder as outlines,
+    // which is the same slot the empty board is made of. Centring the short row instead was tried
+    // and is worse on the thing that matters more than balance: filling a spare slot moves nothing,
+    // where re-centring a row shifts every cell already in it.
+    const slots = [...shown];
+    while (slots.length < cols * rows)
+        slots.push("empty");
+    const cellW = (SIZE - pad * 2 - gap * (cols - 1)) / cols;
+    const cellH = (SIZE - pad * 2 - gap * (rows - 1)) / rows;
+    // Scaled off the cell rather than fixed, or the radius that suits a 36px square swallows a 28px
+    // one and rounds a full-face cell into a lozenge. Lands on 7 for a 3×3, which is where it was.
+    const radius = Math.max(4, Math.min(14, Math.round(Math.min(cellW, cellH) / 5)));
+    let rects = "";
+    for (let i = 0; i < slots.length; i++) {
+        const x = round2(pad + (i % cols) * (cellW + gap));
+        const y = round2(pad + Math.floor(i / cols) * (cellH + gap));
+        const state = slots[i];
+        const stroke = CELL_STROKE[state];
+        rects += `<rect x="${x}" y="${y}" width="${round2(cellW)}" height="${round2(cellH)}"`
+            + ` rx="${radius}"`
+            + ` fill="${CELL_FILL[state]}"`
+            + (stroke ? ` stroke="${stroke}" stroke-width="2"` : "")
+            + ` />`;
+    }
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${SIZE}" height="${SIZE}"`
+        + ` viewBox="0 0 ${SIZE} ${SIZE}">`
+        + `<rect width="${SIZE}" height="${SIZE}" fill="#1c1c1c" />`
+        + rects
+        + `</svg>`;
+    return `data:image/svg+xml;base64,${Buffer.from(svg, "utf8").toString("base64")}`;
+}
+
+const DEFAULT_BOARD_DEFAULTS = {
+    checkFrequency: "5m",
+    expectedStatusCode: 200,
+    timeoutMs: 5000,
+    slowThresholdMs: 1000,
+    amberAfterFailures: 1,
+    redAfterFailures: 3,
+    expectedBodyContains: "",
+    showBodySnippetInHistory: false,
+};
+const DEFAULT_BOARD_SETTINGS = {
+    boardName: "Health board",
+    defaults: DEFAULT_BOARD_DEFAULTS,
+    services: [],
+    runtime: {},
+};
+const EMPTY_RUNTIME = {
+    history: [],
+    currentState: "unknown",
+    consecutiveFailures: 0,
+    lastCheckedAt: null,
+    lastStatusCode: null,
+    lastResponseTimeMs: null,
+};
+
+/**
+ * Pure board logic: merging, normalising and reading. Everything here is a function of settings,
+ * so the parts that decide what gets checked and what the key shows are testable without a
+ * Stream Deck, a network, or a clock.
+ */
+/** Ids only have to be unique within one key's settings, so this is enough. */
+function newServiceId() {
+    return `svc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+function newService(name, url) {
+    return {
+        id: newServiceId(),
+        name,
+        url,
+        expectedStatusCode: null,
+        timeoutMs: null,
+        slowThresholdMs: null,
+        amberAfterFailures: null,
+        redAfterFailures: null,
+        expectedBodyContains: null,
+        showBodySnippetInHistory: null,
+    };
+}
+/** `undefined` and `null` both mean "inherit"; 0 and "" are deliberate values and are kept. */
+function inherit(override, fallback) {
+    return override === null || override === undefined ? fallback : override;
+}
+/**
+ * Flattens a service onto the board's defaults, producing exactly the settings shape the existing
+ * single-endpoint modules already take.
+ *
+ * That is the point: `runHealthCheck`, `evaluateButtonState` and `buildSnapshot` are reused
+ * unchanged, so a board service and a Health Check key are checked and judged by the same code.
+ */
+function resolveService(defaults, service, runtime = EMPTY_RUNTIME) {
+    return {
+        ...DEFAULT_SETTINGS,
+        serviceName: service.name,
+        endpointUrl: service.url,
+        checkFrequency: defaults.checkFrequency,
+        expectedStatusCode: num(inherit(service.expectedStatusCode, defaults.expectedStatusCode), DEFAULT_BOARD_DEFAULTS.expectedStatusCode),
+        timeoutMs: num(inherit(service.timeoutMs, defaults.timeoutMs), DEFAULT_BOARD_DEFAULTS.timeoutMs),
+        slowThresholdMs: num(inherit(service.slowThresholdMs, defaults.slowThresholdMs), DEFAULT_BOARD_DEFAULTS.slowThresholdMs),
+        amberAfterFailures: num(inherit(service.amberAfterFailures, defaults.amberAfterFailures), DEFAULT_BOARD_DEFAULTS.amberAfterFailures),
+        redAfterFailures: num(inherit(service.redAfterFailures, defaults.redAfterFailures), DEFAULT_BOARD_DEFAULTS.redAfterFailures),
+        expectedBodyContains: inherit(service.expectedBodyContains, defaults.expectedBodyContains),
+        showBodySnippetInHistory: inherit(service.showBodySnippetInHistory, defaults.showBodySnippetInHistory),
+        history: runtime.history ?? [],
+        currentState: runtime.currentState ?? "unknown",
+        consecutiveFailures: runtime.consecutiveFailures ?? 0,
+        lastCheckedAt: runtime.lastCheckedAt ?? null,
+        lastStatusCode: runtime.lastStatusCode ?? null,
+        lastResponseTimeMs: runtime.lastResponseTimeMs ?? null,
+    };
+}
+/** Settings arrive from JSON and from inspector fields, which save numbers as strings. */
+function num(value, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+/**
+ * Fills in anything a saved board is missing.
+ *
+ * Settings written by an older build, or by hand, can be missing whole branches — and a board
+ * whose `runtime` is undefined would throw on the first check rather than simply having no
+ * history yet.
+ */
+function mergeBoardSettings(saved) {
+    const services = Array.isArray(saved?.services) ? saved.services : [];
+    const runtime = saved?.runtime ?? {};
+    return {
+        ...DEFAULT_BOARD_SETTINGS,
+        boardName: saved?.boardName || DEFAULT_BOARD_SETTINGS.boardName,
+        defaults: { ...DEFAULT_BOARD_DEFAULTS, ...(saved?.defaults ?? {}) },
+        services,
+        // Runtime for services that no longer exist is dropped here rather than accumulating
+        // forever; an undo that restores a service restores its runtime alongside it.
+        runtime: Object.fromEntries(services.map((service) => [service.id, runtime[service.id] ?? { ...EMPTY_RUNTIME }])),
+    };
+}
+function runtimeFor(settings, id) {
+    return settings.runtime[id] ?? { ...EMPTY_RUNTIME };
+}
+/**
+ * The key face, in list order.
+ *
+ * A service with no URL reads as a configuration error rather than as unknown, so a half-finished
+ * entry is visible on the key instead of looking like one that has simply not run yet.
+ */
+function boardCells(settings) {
+    return settings.services.map((service) => {
+        if (!service.url.trim())
+            return "config-error";
+        return runtimeFor(settings, service.id).currentState;
+    });
+}
+
+function buildBoardOverview(settings, undo = null) {
+    const services = settings.services.map((service) => {
+        const runtime = runtimeFor(settings, service.id);
+        // The service's own threshold, not the board's: a service that overrides it was being
+        // measured against a number it does not use, so its slow count and its bars disagreed with
+        // its own state.
+        const slowThresholdMs = resolveService(settings.defaults, service, runtime).slowThresholdMs;
+        const stats = buildStats(runtime.history ?? [], slowThresholdMs);
+        const state = service.url.trim() ? runtime.currentState : "config-error";
+        return {
+            id: service.id,
+            name: service.name || "Unnamed service",
+            url: service.url,
+            state,
+            stateLabel: stateLabel(state),
+            lastResponseTimeMs: runtime.lastResponseTimeMs,
+            lastCheckedAt: runtime.lastCheckedAt,
+            uptimePct: stats.uptimePct,
+            checks: stats.total,
+            consecutiveFailures: runtime.consecutiveFailures,
+            lastError: lastErrorOf(runtime.history ?? [], service),
+            spark: (runtime.history ?? []).slice(-24).map((record) => ({
+                ms: record.responseTimeMs,
+                state: !record.ok ? "fail" : record.responseTimeMs > slowThresholdMs ? "slow" : "ok",
+            })),
+        };
+    });
+    return {
+        boardName: settings.boardName,
+        frequency: frequencyLabel(settings.defaults.checkFrequency),
+        services,
+        capacity: BOARD_CAPACITY,
+        undo,
+        defaults: settings.defaults,
+        configs: settings.services,
+        total: services.length,
+        // Slow is not failing — it answered. Kept apart so the header can say both.
+        failing: services.filter((s) => s.state === "down" || s.state === "warning" || s.state === "config-error").length,
+        slow: services.filter((s) => s.state === "slow").length,
+        generatedAt: Date.now(),
+    };
+}
+/**
+ * The reason a service is failing, in the words the check produced.
+ *
+ * A card showing "Failed" says less than one showing "Expected 200 but received 503", and the
+ * difference is what tells you whether to look further. A service with no URL has not failed a
+ * check at all — it has never run one — so it says what is actually wrong with it.
+ */
+function lastErrorOf(history, service) {
+    if (!service.url.trim())
+        return "No URL configured";
+    const last = history[history.length - 1];
+    if (!last || last.ok)
+        return null;
+    return last.error ?? "Check failed";
+}
+
+/** Wider than the history window: the same content, plus a list rail beside it. */
+const WINDOW_WIDTH = 1080;
+/**
+ * Four rows of cards already fit here, which is a full board at three across.
+ *
+ * This was briefly raised to 900 on the assumption that the fourth row would not fit. Measured on
+ * a real eleven-service board instead: four rows and their gaps are about 613px, the header above
+ * the grid about 72px and the footer about 30px, so roughly 715 of the 740. Raising it bought
+ * nothing and left 215px of empty space under the last row. Leave it alone without measuring.
+ */
+const WINDOW_HEIGHT = 740;
+const VERTICAL_BIAS = 0.35;
+const DEFAULT_TIMEOUT_MS = 10 * 60_000;
+const POLL_MS = 2_000;
+/** Serialises for a `<script>` block; `<` must be escaped or a `</script>` inside data ends it. */
+function embedJson(value) {
+    return JSON.stringify(value).replace(/</g, "\\u003c");
+}
+function escapeHtml(text) {
+    return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+/** Lucide `refresh-cw`, ISC — the same mark the history window's Check now button carries. */
+const REFRESH_SVG = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"`
+    + ` stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+    + `<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>`
+    + `<path d="M21 3v5h-5"/>`
+    + `<path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>`
+    + `<path d="M8 16H3v5"/></svg>`;
+/**
+ * Builds the page.
+ *
+ * Exported as a test seam, for the same reason the history window's is: this is one large
+ * template literal, and a stray backtick in it produces a page whose script cannot parse, which
+ * shows as a window that opens completely blank.
+ */
+function renderBoardHtml(overview, token, options = {}) {
+    const winW = options.width ?? WINDOW_WIDTH;
+    const winH = options.height ?? WINDOW_HEIGHT;
+    const pollMs = options.pollMs ?? POLL_MS;
+    return `<!doctype html>
+<html lang="en" style="background:#333333">
+<head>
+<meta charset="utf-8" />
+<meta name="color-scheme" content="dark" />
+<title>${escapeHtml(overview.boardName)} — PulseDeck</title>
+<script>
+/* Sizes and places a browser window ahead of first paint; the native host needs none of it. */
+(function () {
+  var W = ${winW}, H = ${winH};
+  var root = document.documentElement;
+  var revealed = false;
+  function reveal() {
+    if (revealed) return;
+    revealed = true;
+    root.classList.add('ready');
+  }
+  if (window.__nativeHost) { reveal(); return; }
+  try {
+    var chromeW = Math.max(0, window.outerWidth - window.innerWidth);
+    var chromeH = Math.max(0, window.outerHeight - window.innerHeight);
+    var outerW = W + chromeW, outerH = H + chromeH;
+    window.resizeTo(outerW, outerH);
+    window.moveTo(
+      Math.round((screen.availWidth - outerW) / 2) + (screen.availLeft || 0),
+      Math.round((screen.availHeight - outerH) * ${VERTICAL_BIAS}) + (screen.availTop || 0)
+    );
+  } catch (e) {
+    reveal();
+  }
+  window.addEventListener('resize', function onResize() {
+    window.removeEventListener('resize', onResize);
+    requestAnimationFrame(reveal);
+  });
+  setTimeout(reveal, 250);
+})();
+</script>
+<style>
+  /* The Quick Clips picker's palette, as the history window uses. */
+  :root {
+    color-scheme: dark;
+    --bg: #333333;
+    --header: rgba(51,51,51,.92);
+    --line: rgba(255,255,255,.08);
+    --fg: #f4f4f6;
+    --fg-dim: #8b8b93;
+    --fg-faint: #62626b;
+    --card: #262626;
+    --card-line: #515151;
+    --hover: rgba(255,255,255,.04);
+    --kbd: rgba(255,255,255,.09);
+    --shadow: 0 1px 2px rgba(0,0,0,.3);
+    --shadow-lift: 0 6px 18px rgba(0,0,0,.45);
+    --accent: #6d9eeb;
+
+    --ok: var(--accent);
+    --good: #4cc94c;
+    --slow: #fab219;
+    --fail: #d03b3b;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  html { background: var(--bg); }
+  html:not(.ready) body { visibility: hidden; }
+  body {
+    margin: 0;
+    font: 400 13px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
+    background: var(--bg); color: var(--fg);
+    -webkit-font-smoothing: antialiased;
+    -webkit-user-select: none; user-select: none;
+    display: flex; overflow: hidden;
+  }
+
+  /* ── rail ───────────────────────────────────────────────────────────── */
+  .rail {
+    flex: 0 0 236px; display: flex; flex-direction: column; min-height: 0;
+    padding: 16px 12px 12px 16px; gap: 10px;
+    /*
+     * min-width:0 is what makes the basis binding.
+     *
+     * A flex item defaults to min-width:auto, which means "never narrower than my content" — and
+     * the rows inside are nowrap, so a long service name has no minimum at all. The rail grew to
+     * fit the longest name and stole the width from the pane beside it, rather than the name
+     * truncating. Every ellipsis below depends on this line.
+     */
+    min-width: 0;
+  }
+  .board-name {
+    font-size: 15px; font-weight: 600; letter-spacing: -.015em; margin: 0 4px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .board-sub { font-size: 11px; color: var(--fg-faint); margin: 2px 4px 0; }
+  .list { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+  .row {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    padding: 7px 9px; border-radius: 8px; border: 0; background: transparent;
+    color: var(--fg); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer;
+  }
+  .row:hover { background: var(--hover); }
+  .row.on { background: var(--kbd); }
+  .row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .row .label { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .count { font-size: 11px; color: var(--fg-faint); font-variant-numeric: tabular-nums; }
+  .dot {
+    display: inline-block; flex: none;
+    width: 9px; height: 9px; border-radius: 50%; background: var(--fg-faint);
+  }
+  .dot[data-state="healthy"] { background: var(--good); }
+  .dot[data-state="slow"] { background: var(--slow); }
+  .dot[data-state="warning"], .dot[data-state="down"], .dot[data-state="config-error"] { background: var(--fail); }
+  .rail-foot { display: flex; flex-direction: column; gap: 2px; }
+  .row.muted { color: var(--fg-dim); }
+
+  /* ── detail ─────────────────────────────────────────────────────────── */
+  main {
+    flex: 1 1 auto; min-width: 0; min-height: 0;
+    display: flex; flex-direction: column; padding: 16px 18px 12px 8px; gap: 12px;
+  }
+  .head { display: flex; align-items: center; gap: 14px; }
+  .head .titles { flex: 1 1 auto; min-width: 0; }
+  h1 {
+    margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -.015em;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .head .sub {
+    font-size: 12px; color: var(--fg-dim); margin-top: 2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  button.primary {
+    font: inherit; font-size: 12px; font-weight: 600; color: var(--bg);
+    background: var(--accent); border: 0; border-radius: 7px;
+    padding: 6px 12px; cursor: pointer; flex: 0 0 auto;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  button.primary:disabled { background: var(--card-line); color: var(--fg-faint); cursor: default; }
+  button.primary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.primary:disabled svg { animation: spin .9s linear infinite; transform-origin: 50% 50%; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { button.primary:disabled svg { animation: none; } }
+
+  .frame { flex: 1 1 auto; min-height: 0; display: flex; position: relative; }
+  /*
+   * The incoming frame loads underneath the outgoing one.
+   *
+   * A fresh document paints its own canvas white before its stylesheet applies, and no colour on
+   * the iframe element can cover that — the flash is inside the frame, not behind it. So the new
+   * one is laid over the old at zero opacity and only swapped in once it has loaded, which means
+   * the pane is never showing a document mid-paint.
+   */
+  iframe.loading { position: absolute; inset: 0; opacity: 0; pointer-events: none; }
+  .grid {
+    flex: 1 1 auto; min-height: 0; overflow-y: auto;
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 11px; align-content: start;
+  }
+  .cardbtn {
+    text-align: left; font: inherit; color: var(--fg); cursor: pointer;
+    background: var(--card); border: 2px solid var(--card-line); border-radius: 11px;
+    box-shadow: var(--shadow); padding: 11px 13px 10px;
+    display: flex; flex-direction: column; gap: 3px; min-width: 0;
+  }
+  .cardbtn:hover { background: var(--hover); }
+  .cardbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .cardbtn .name {
+    font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .cardbtn .state { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--fg-dim); }
+  .cardbtn .figure {
+    font-size: 20px; font-weight: 600; letter-spacing: -.02em; margin-top: 1px;
+  }
+  .cardbtn .figure .unit { font-size: 11px; font-weight: 500; color: var(--fg-dim); margin-left: 3px; }
+  .cardbtn .meta { font-size: 11px; color: var(--fg-faint); }
+  /*
+   * Emphasis, not decoration: a healthy card is left alone.
+   *
+   * Colouring every card would make a wall of green that says nothing, and the eye would have to
+   * find the one that differs by hue alone. Only the exceptions are marked — a red edge and a
+   * tinted face for something failing, amber for something slow — so trouble is the thing that
+   * looks different rather than one of twelve things that look busy.
+   */
+  .cardbtn[data-state="slow"] { border-color: var(--slow); }
+  .cardbtn[data-state="down"], .cardbtn[data-state="warning"],
+  .cardbtn[data-state="config-error"] {
+    border-color: var(--fail); background: #2f2323;
+  }
+  .cardbtn[data-state="down"]:hover, .cardbtn[data-state="warning"]:hover,
+  .cardbtn[data-state="config-error"]:hover { background: #352626; }
+  .cardbtn svg { display: block; width: 100%; height: 26px; margin-top: 4px; }
+
+  .empty {
+    flex: 1 1 auto; display: flex; align-items: center; justify-content: center;
+    color: var(--fg-faint); font-size: 12px; text-align: center; padding: 30px;
+  }
+  /*
+   * The selected service's view is the history window's own page in a frame.
+   *
+   * A frame rather than a copy of its markup: the chart, the tooltip, the filter and the sort are
+   * a few hundred lines that are already written and tested, and a second implementation of them
+   * would drift within a week. It is same-origin, so it shares nothing but the server.
+   */
+  iframe {
+    flex: 1 1 auto; min-height: 0; width: 100%;
+    border: 0; border-radius: 11px;
+    /* The element's own colour, so the gap between one document unloading and the next painting
+       is the page colour rather than the browser's white canvas. */
+    background: var(--bg); color-scheme: dark;
+  }
+  .panel {
+    background: var(--card); border: 2px solid var(--card-line); border-radius: 11px;
+    box-shadow: var(--shadow); padding: 13px 15px 12px;
+  }
+  .panel h2 { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+  .panel p { margin: 0 0 4px; color: var(--fg-dim); font-size: 12px; }
+  .panel .url { color: var(--fg-faint); -webkit-user-select: text; user-select: text; }
+
+  /* ── forms ──────────────────────────────────────────────────────────── */
+  .form { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding-right: 4px; }
+  .field { display: flex; align-items: center; gap: 12px; margin-bottom: 9px; }
+  .field label { flex: 0 0 132px; font-size: 12px; color: var(--fg-dim); text-align: right; }
+  .field input[type="text"], .field select {
+    flex: 1 1 auto; min-width: 0; font: inherit; font-size: 12.5px; color: var(--fg);
+    background: var(--card); border: 1px solid var(--card-line); border-radius: 7px;
+    padding: 6px 9px; outline: none;
+  }
+  .field input:focus, .field select:focus { border-color: var(--accent); }
+  .field .hint { flex: 0 0 auto; font-size: 11px; color: var(--fg-faint); }
+  .field.check { align-items: center; }
+  .field.check input { margin: 0; }
+  details { margin: 14px 0 4px; }
+  summary {
+    cursor: pointer; font-size: 12px; color: var(--fg-dim); margin-bottom: 10px;
+    padding-left: 132px;
+  }
+  summary:hover { color: var(--fg); }
+  .form-actions {
+    display: flex; align-items: center; gap: 8px; margin: 16px 0 4px; padding-left: 144px;
+  }
+  button.ghost {
+    font: inherit; font-size: 12px; color: var(--fg-dim);
+    background: transparent; border: 1px solid var(--card-line); border-radius: 7px;
+    padding: 6px 12px; cursor: pointer;
+  }
+  button.ghost:hover { background: var(--kbd); color: var(--fg); }
+  button.ghost.danger:hover { color: var(--fail); }
+  button.ghost:focus-visible, button.primary:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  .error { color: #ff8080; font-size: 11.5px; padding-left: 144px; min-height: 15px; }
+
+  /* A notice, in the footer's line rather than over the content it is about. */
+  .notice { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--fg-dim); }
+  .notice button {
+    font: inherit; font-size: 11px; color: var(--accent);
+    background: transparent; border: 0; padding: 0; cursor: pointer; text-decoration: underline;
+  }
+
+  /*
+   * Reordering lives on the row, because the row's order is what it changes.
+   *
+   * Hidden with visibility rather than display, so the controls keep their box and the row does
+   * not change size as the pointer crosses it — the label would otherwise reflow and the whole
+   * list would twitch as you moved down it.
+   */
+  .row .moves { display: flex; visibility: hidden; gap: 1px; flex: 0 0 auto; }
+  .row:hover .moves, .row.on .moves { visibility: visible; }
+  .row .moves span {
+    width: 16px; height: 16px; border-radius: 4px; display: grid; place-items: center;
+    color: var(--fg-faint); font-size: 9px;
+  }
+  .row .moves span:hover { background: var(--kbd); color: var(--fg); }
+  .row .moves span.off { opacity: .25; pointer-events: none; }
+
+  footer { flex: 0 0 auto; display: flex; align-items: center; gap: 16px; height: 30px; }
+  footer span { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--fg-faint); }
+  footer .keys { margin-left: auto; gap: 12px; }
+  kbd {
+    display: inline-grid; place-items: center; min-width: 17px; height: 17px; padding: 0 4px;
+    background: var(--kbd); border-radius: 4px; font: inherit; font-size: 10px; color: var(--fg-dim);
+  }
+</style>
+</head>
+<body>
+<nav class="rail">
+  <div>
+    <h2 class="board-name" id="board-name"></h2>
+    <p class="board-sub" id="board-sub"></p>
+  </div>
+  <div class="list" id="list"></div>
+  <div class="rail-foot">
+    <button type="button" class="row muted" id="add"><span class="label">Add service</span></button>
+    <button type="button" class="row muted" id="settings"><span class="label">Board settings</span></button>
+  </div>
+</nav>
+
+<main>
+  <div class="head">
+    <div class="titles">
+      <h1 id="title"></h1>
+      <div class="sub" id="subtitle"></div>
+    </div>
+    <button type="button" class="ghost" id="edit" hidden>Edit</button>
+    <button type="button" class="primary" id="check">${REFRESH_SVG}<span id="check-label">Check all</span></button>
+  </div>
+  <div id="detail" class="grid"></div>
+  <footer>
+    <span id="foot"></span>
+    <span class="notice" id="notice" hidden></span>
+    <span class="keys"><span><kbd>esc</kbd> close</span></span>
+  </footer>
+</main>
+
+<script>
+(function () {
+  'use strict';
+  var TOKEN = ${embedJson(token)};
+  var POLL_MS = ${pollMs};
+  var data = ${embedJson(overview)};
+  /** null means the All view; otherwise the id of the selected service. */
+  var selected = null;
+  /** 'list' shows the selection; the others are the forms, which sit over it. */
+  var view = 'list';
+
+  window.addEventListener('error', function (e) {
+    post('error', { message: String(e.message) + ' @' + e.lineno + ':' + e.colno });
+  });
+
+  function post(type, extra) {
+    var body = { type: type };
+    if (extra) for (var k in extra) body[k] = extra[k];
+    return fetch('/message?t=' + encodeURIComponent(TOKEN), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) { return r.json(); }).catch(function () { return {}; });
+  }
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = text;
+    return node;
+  }
+
+  function ms(value) {
+    if (value === null || value === undefined) return '—';
+    if (value >= 10000) return (value / 1000).toFixed(1) + ' s';
+    return value + ' ms';
+  }
+
+  function agoOf(iso) {
+    if (!iso) return 'never checked';
+    var seconds = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+    if (seconds < 5) return 'just now';
+    if (seconds < 60) return seconds + 's ago';
+    if (seconds < 3600) return Math.round(seconds / 60) + 'm ago';
+    if (seconds < 86400) return Math.round(seconds / 3600) + 'h ago';
+    return Math.round(seconds / 86400) + 'd ago';
+  }
+
+  function serviceById(id) {
+    for (var i = 0; i < data.services.length; i++) {
+      if (data.services[i].id === id) return data.services[i];
+    }
+    return null;
+  }
+
+  /* ── rail ────────────────────────────────────────────────────────────── */
+
+  function paintRail() {
+    document.getElementById('board-name').textContent = data.boardName;
+    var sub = data.total === 0 ? 'no services yet'
+      : data.total + (data.total === 1 ? ' service · ' : ' services · ') + data.frequency;
+    document.getElementById('board-sub').textContent = sub;
+
+    var add = document.getElementById('add');
+    add.disabled = data.total >= data.capacity;
+    add.querySelector('.label').textContent =
+      data.total >= data.capacity ? 'Board full (' + data.capacity + ')' : 'Add service';
+
+    var list = document.getElementById('list');
+    list.textContent = '';
+
+    var all = el('button', 'row' + (selected === null ? ' on' : ''));
+    all.type = 'button';
+    all.appendChild(el('span', 'label', 'All services'));
+    all.appendChild(el('span', 'count', String(data.total)));
+    all.addEventListener('click', function () { select(null); });
+    list.appendChild(all);
+
+    for (var i = 0; i < data.services.length; i++) {
+      (function (service, index) {
+        var row = el('button', 'row' + (selected === service.id ? ' on' : ''));
+        row.type = 'button';
+        var dot = el('i', 'dot');
+        dot.setAttribute('data-state', service.state);
+        row.appendChild(dot);
+        var label = el('span', 'label', service.name);
+        // Truncation hides text, so the whole name stays available on hover.
+        label.title = service.name;
+        row.appendChild(label);
+
+        /*
+         * Up and down live on the row because the row's position is what they change, and that
+         * position is the cell the service occupies on the key — top-left is the first row.
+         */
+        var moves = el('span', 'moves');
+        moves.appendChild(moveControl('\u25B2', service.id, -1, index === 0));
+        moves.appendChild(moveControl('\u25BC', service.id, 1, index === data.services.length - 1));
+        row.appendChild(moves);
+
+        row.addEventListener('click', function () { select(service.id); });
+        list.appendChild(row);
+      })(data.services[i], i);
+    }
+  }
+
+  function moveControl(glyph, id, delta, disabled) {
+    var control = el('span', disabled ? 'off' : '', glyph);
+    control.setAttribute('role', 'button');
+    control.title = delta < 0 ? 'Move up' : 'Move down';
+    control.addEventListener('click', function (e) {
+      // The row is a button and a click on the control would select it as well.
+      e.stopPropagation();
+      if (disabled) return;
+      post('move-service', { id: id, delta: delta }).then(refresh);
+    });
+    return control;
+  }
+
+  /* ── sparkline ───────────────────────────────────────────────────────── */
+
+  /**
+   * One card's response times. Failures are drawn as full-height marks rather than as their
+   * elapsed time, the same rule the history chart follows: a refused connection returns in
+   * three milliseconds and would otherwise read as the fastest check on the card.
+   */
+  function sparkSvg(points) {
+    if (!points.length) return '';
+    var W = 160, H = 26, gap = 1.5;
+    var band = W / points.length;
+    var barW = Math.max(1.2, band - gap);
+    var top = 0;
+    for (var i = 0; i < points.length; i++) {
+      if (points[i].state !== 'fail' && points[i].ms > top) top = points[i].ms;
+    }
+    if (top <= 0) top = 1;
+    var svg = '';
+    for (var j = 0; j < points.length; j++) {
+      var x = j * band;
+      var point = points[j];
+      var failed = point.state === 'fail';
+      var h = failed ? H : Math.max(1.5, (Math.min(point.ms, top) / top) * (H - 2));
+      var y = H - h;
+      // The same three colours the chart and the key use, so a bar means the same thing wherever
+      // it appears: a slow check is amber here as well as on the card's own state line.
+      var fill = failed ? 'var(--fail)' : point.state === 'slow' ? 'var(--slow)' : 'var(--ok)';
+      svg += '<rect x="' + x.toFixed(2) + '" y="' + y.toFixed(2) + '" width="' + barW.toFixed(2)
+        + '" height="' + h.toFixed(2) + '" rx="1" style="fill:' + fill + '" />';
+    }
+    return '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" aria-hidden="true">'
+      + svg + '</svg>';
+  }
+
+  /* ── detail ──────────────────────────────────────────────────────────── */
+
+  function paintAll() {
+    document.getElementById('edit').hidden = true;
+    var detail = document.getElementById('detail');
+    detail.className = 'grid';
+    detail.textContent = '';
+
+    document.getElementById('title').textContent = 'All services';
+    var parts = [];
+    if (data.total === 0) parts.push('nothing configured yet');
+    else {
+      parts.push(data.total - data.failing + ' of ' + data.total + ' healthy');
+      if (data.slow) parts.push(data.slow + ' slow');
+      if (data.failing) parts.push(data.failing + ' failing');
+    }
+    document.getElementById('subtitle').textContent = parts.join(' · ');
+
+    if (!data.services.length) {
+      var note = el('div', 'empty',
+        'No services on this board yet. Add them from the key\\u2019s Property Inspector for now — '
+        + 'adding them here is the next piece of work.');
+      detail.className = '';
+      detail.appendChild(note);
+      return;
+    }
+
+    for (var i = 0; i < data.services.length; i++) {
+      (function (service) {
+        var card = el('button', 'cardbtn');
+        card.type = 'button';
+        card.title = service.name;
+        card.appendChild(el('div', 'name', service.name));
+
+        var state = el('div', 'state');
+        var dot = el('i', 'dot');
+        dot.setAttribute('data-state', service.state);
+        state.appendChild(dot);
+        state.appendChild(el('span', null, service.stateLabel));
+        card.appendChild(state);
+
+        var failing = service.state === 'down' || service.state === 'warning'
+          || service.state === 'config-error';
+        var figure;
+        if (failing && service.consecutiveFailures > 0) {
+          // A failing service's latency is the time it took to fail, which is not a number worth
+          // leading with. How many checks in a row have failed is.
+          figure = el('div', 'figure', String(service.consecutiveFailures));
+          figure.appendChild(el('span', 'unit',
+            service.consecutiveFailures === 1 ? 'failure' : 'failures in a row'));
+        } else {
+          figure = el('div', 'figure',
+            service.lastResponseTimeMs === null ? '—' : String(service.lastResponseTimeMs));
+          if (service.lastResponseTimeMs !== null) figure.appendChild(el('span', 'unit', 'ms'));
+        }
+        card.appendChild(figure);
+
+        card.setAttribute('data-state', service.state);
+        card.appendChild(el('div', 'meta',
+          (service.uptimePct === null ? 'no checks' : service.uptimePct + '% up')
+          + ' · ' + agoOf(service.lastCheckedAt)));
+
+        /*
+         * The reason lives on hover, not on the card.
+         *
+         * As a line of its own it only appeared on failing cards, so those cards grew taller than
+         * the rest and the row stopped reading as a grid — the layout moved to tell you something
+         * the colour had already said. The service view is where the reason belongs in full.
+         */
+        if (service.lastError) card.title = service.name + ' — ' + service.lastError;
+
+        if (service.spark.length) {
+          var holder = document.createElement('div');
+          holder.innerHTML = sparkSvg(service.spark);
+          if (holder.firstChild) card.appendChild(holder.firstChild);
+        }
+
+        card.addEventListener('click', function () { select(service.id); });
+        detail.appendChild(card);
+      })(data.services[i]);
+    }
+  }
+
+  function paintService(id) {
+    var service = serviceById(id);
+    if (!service) return select(null);
+
+    var title = document.getElementById('title');
+    title.textContent = service.name;
+    title.title = service.name;
+    document.getElementById('subtitle').textContent =
+      service.stateLabel + ' · ' + agoOf(service.lastCheckedAt);
+    document.getElementById('edit').hidden = false;
+
+    var detail = document.getElementById('detail');
+    detail.className = 'frame';
+
+    /*
+     * Only rebuilt when the selection changes.
+     *
+     * The frame keeps its own state — scroll position, table filter, sort, an open tooltip — and
+     * replacing it on every two-second poll would reset all of it under the cursor. It polls the
+     * same server itself, so it stays current without being touched.
+     */
+    /*
+     * Anything that is not a frame belongs to the view we are leaving — the card grid, or a form
+     * — and goes now. Only frames survive this, because a frame is what the swap below is
+     * comparing against; clearing them here would defeat the point of loading behind the old one.
+     */
+    var children = Array.prototype.slice.call(detail.children);
+    for (var c = 0; c < children.length; c++) {
+      if (children[c].tagName !== 'IFRAME') detail.removeChild(children[c]);
+    }
+
+    var current = detail.querySelector('iframe:not(.loading)');
+    if (current && current.getAttribute('data-id') === id) return;
+
+    /*
+     * The incoming frame loads underneath the outgoing one, and they swap on load.
+     *
+     * A fresh document paints its own canvas before its stylesheet applies, which showed as a
+     * white flash on every switch — no colour on the iframe element can cover that, because the
+     * flash is inside the frame rather than behind it. Loading it at zero opacity over the top of
+     * the previous one means the pane is never showing a document mid-paint.
+     */
+    var pending = detail.querySelector('iframe.loading');
+    if (pending) detail.removeChild(pending);
+
+    var next = document.createElement('iframe');
+    next.className = 'loading';
+    next.setAttribute('data-id', id);
+    next.setAttribute('title', service.name);
+    next.src = '/service?id=' + encodeURIComponent(id) + '&t=' + encodeURIComponent(TOKEN);
+
+    var swapped = false;
+    function swap() {
+      if (swapped) return;
+      swapped = true;
+      next.className = '';
+      if (current && current.parentNode) current.parentNode.removeChild(current);
+    }
+    next.addEventListener('load', swap);
+    // If load never arrives, show it anyway rather than leaving the previous service on screen
+    // under the new service's name.
+    setTimeout(swap, 1500);
+    detail.appendChild(next);
+  }
+
+  /* ── forms ───────────────────────────────────────────────────────────── */
+
+  function field(label, hint) {
+    var wrap = el('div', 'field');
+    wrap.appendChild(el('label', null, label));
+    var input = document.createElement('input');
+    input.type = 'text';
+    wrap.appendChild(input);
+    if (hint) wrap.appendChild(el('span', 'hint', hint));
+    return { wrap: wrap, input: input };
+  }
+
+  function selectField(label, options, value) {
+    var wrap = el('div', 'field');
+    wrap.appendChild(el('label', null, label));
+    var select = document.createElement('select');
+    for (var i = 0; i < options.length; i++) {
+      var option = document.createElement('option');
+      option.value = options[i][0];
+      option.textContent = options[i][1];
+      if (options[i][0] === value) option.selected = true;
+      select.appendChild(option);
+    }
+    wrap.appendChild(select);
+    return { wrap: wrap, input: select };
+  }
+
+  function checkField(label, text, checked) {
+    var wrap = el('div', 'field check');
+    wrap.appendChild(el('label', null, label));
+    var input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = !!checked;
+    wrap.appendChild(input);
+    wrap.appendChild(el('span', 'hint', text));
+    return { wrap: wrap, input: input };
+  }
+
+  /** Blank means inherit, so an override reads as a number or as nothing at all. */
+  function overrideValue(raw) {
+    var text = String(raw === null || raw === undefined ? '' : raw).trim();
+    if (text === '') return null;
+    var value = Number(text);
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+
+  function configById(id) {
+    for (var i = 0; i < data.configs.length; i++) {
+      if (data.configs[i].id === id) return data.configs[i];
+    }
+    return null;
+  }
+
+  /**
+   * The add and edit form.
+   *
+   * Overrides are collapsed behind a disclosure and show the board's value as a placeholder, so
+   * an empty field reads as "whatever the board says" rather than as unset. That is the whole
+   * point of shared defaults: a board should not carry twelve copies of the same timeout.
+   */
+  function paintForm(id) {
+    var editing = !!id;
+    var config = editing ? configById(id) : null;
+    if (editing && !config) return select(null);
+
+    document.getElementById('title').textContent = editing ? 'Edit service' : 'Add service';
+    document.getElementById('subtitle').textContent = editing
+      ? 'Changes take effect on the next check, which runs as soon as you save.'
+      : 'It is checked as soon as you add it.';
+    document.getElementById('check').hidden = true;
+
+    var detail = document.getElementById('detail');
+    detail.className = 'form';
+    detail.textContent = '';
+
+    var name = field('Name', 'shown on the card and in the list');
+    name.input.value = config ? config.name : '';
+    name.input.placeholder = 'Optional — defaults to the host';
+    var url = field('URL');
+    url.input.value = config ? config.url : '';
+    url.input.placeholder = 'https://api.example.com/health';
+    detail.appendChild(name.wrap);
+    detail.appendChild(url.wrap);
+
+    var advanced = document.createElement('details');
+    advanced.open = !!(config && hasOverrides(config));
+    advanced.appendChild(el('summary', null, 'Overrides for this service'));
+
+    var d = data.defaults;
+    var status = field('Expected status', 'board: ' + d.expectedStatusCode);
+    var timeout = field('Timeout (ms)', 'board: ' + d.timeoutMs);
+    var slow = field('Slow over (ms)', 'board: ' + d.slowThresholdMs);
+    var amber = field('Amber after', 'board: ' + d.amberAfterFailures);
+    var red = field('Red after', 'board: ' + d.redAfterFailures);
+    var body = field('Body contains', d.expectedBodyContains ? 'board: ' + d.expectedBodyContains : 'board: not checked');
+    var fields = [status, timeout, slow, amber, red, body];
+    var keys = ['expectedStatusCode', 'timeoutMs', 'slowThresholdMs', 'amberAfterFailures',
+                'redAfterFailures', 'expectedBodyContains'];
+    for (var f = 0; f < fields.length; f++) {
+      var stored = config ? config[keys[f]] : null;
+      fields[f].input.value = stored === null || stored === undefined ? '' : String(stored);
+      fields[f].input.placeholder = 'inherit';
+      advanced.appendChild(fields[f].wrap);
+    }
+    var snippet = checkField('Body snippet', 'store the response body in this service\u2019s history',
+      config && config.showBodySnippetInHistory !== null
+        ? config.showBodySnippetInHistory : d.showBodySnippetInHistory);
+    advanced.appendChild(snippet.wrap);
+    detail.appendChild(advanced);
+
+    var error = el('div', 'error');
+    var actions = el('div', 'form-actions');
+    var save = el('button', 'primary', editing ? 'Save changes' : 'Add service');
+    save.type = 'button';
+    var cancel = el('button', 'ghost', 'Cancel');
+    cancel.type = 'button';
+    actions.appendChild(save);
+    actions.appendChild(cancel);
+    if (editing) {
+      var remove = el('button', 'ghost danger', 'Delete');
+      remove.type = 'button';
+      remove.addEventListener('click', function () {
+        post('delete-service', { id: id }).then(function () {
+          select(null);
+          refresh();
+        });
+      });
+      actions.appendChild(remove);
+    }
+    detail.appendChild(actions);
+    detail.appendChild(error);
+
+    cancel.addEventListener('click', function () { select(editing ? id : null); });
+
+    save.addEventListener('click', function () {
+      var value = url.input.value.trim();
+      if (!value) return fail('A URL is required.');
+      // Deliberately string comparison rather than a regex: this page is a template literal, and
+      // the backslashes in /^https?:\\/\\// are consumed by it — the pattern reached the browser
+      // as /^https?:\/\// with its slashes unescaped, which is a different, broken expression.
+      var lower = value.toLowerCase();
+      if (lower.indexOf('http://') !== 0 && lower.indexOf('https://') !== 0) {
+        return fail('The URL must start with http:// or https://.');
+      }
+
+      var draft = {
+        name: name.input.value.trim(),
+        url: value,
+        expectedStatusCode: overrideValue(status.input.value),
+        timeoutMs: overrideValue(timeout.input.value),
+        slowThresholdMs: overrideValue(slow.input.value),
+        amberAfterFailures: overrideValue(amber.input.value),
+        redAfterFailures: overrideValue(red.input.value),
+        expectedBodyContains: body.input.value.trim() === '' ? null : body.input.value,
+        showBodySnippetInHistory: snippet.input.checked
+      };
+
+      save.disabled = true;
+      post(editing ? 'update-service' : 'add-service', { id: id, draft: draft })
+        .then(function (reply) {
+          save.disabled = false;
+          if (reply.message) return fail(reply.message);
+          apply(reply.data);
+          select(editing ? id : (reply.id || null));
+        });
+
+      function fail(message) {
+        error.textContent = message;
+        return false;
+      }
+    });
+
+    function fail(message) {
+      error.textContent = message;
+      return false;
+    }
+  }
+
+  function hasOverrides(config) {
+    var keys = ['expectedStatusCode', 'timeoutMs', 'slowThresholdMs', 'amberAfterFailures',
+                'redAfterFailures', 'expectedBodyContains', 'showBodySnippetInHistory'];
+    for (var i = 0; i < keys.length; i++) {
+      if (config[keys[i]] !== null && config[keys[i]] !== undefined) return true;
+    }
+    return false;
+  }
+
+  /** The board's own settings: its name, its clock, and what every service inherits. */
+  function paintSettings() {
+    document.getElementById('title').textContent = 'Board settings';
+    document.getElementById('subtitle').textContent =
+      'Every service uses these unless it overrides them.';
+    document.getElementById('check').hidden = true;
+
+    var detail = document.getElementById('detail');
+    detail.className = 'form';
+    detail.textContent = '';
+
+    var d = data.defaults;
+    var name = field('Board name');
+    name.input.value = data.boardName;
+    var frequency = selectField('Check every', [
+      ['manual', 'Manual only'], ['1m', 'Minute'], ['5m', '5 minutes'],
+      ['10m', '10 minutes'], ['30m', '30 minutes'], ['1h', 'Hour']
+    ], d.checkFrequency);
+    var status = field('Expected status');
+    status.input.value = String(d.expectedStatusCode);
+    var timeout = field('Timeout (ms)');
+    timeout.input.value = String(d.timeoutMs);
+    var slow = field('Slow over (ms)');
+    slow.input.value = String(d.slowThresholdMs);
+    var amber = field('Amber after', 'failures');
+    amber.input.value = String(d.amberAfterFailures);
+    var red = field('Red after', 'failures');
+    red.input.value = String(d.redAfterFailures);
+    var body = field('Body contains', 'blank to skip the body');
+    body.input.value = d.expectedBodyContains;
+    var snippet = checkField('Body snippet', 'store response bodies in history',
+      d.showBodySnippetInHistory);
+
+    var rows = [name, frequency, status, timeout, slow, amber, red, body, snippet];
+    for (var i = 0; i < rows.length; i++) detail.appendChild(rows[i].wrap);
+
+    var error = el('div', 'error');
+    var actions = el('div', 'form-actions');
+    var save = el('button', 'primary', 'Save settings');
+    save.type = 'button';
+    var cancel = el('button', 'ghost', 'Cancel');
+    cancel.type = 'button';
+    actions.appendChild(save);
+    actions.appendChild(cancel);
+    detail.appendChild(actions);
+    detail.appendChild(error);
+
+    cancel.addEventListener('click', function () { select(null); });
+    save.addEventListener('click', function () {
+      var update = {
+        boardName: name.input.value.trim(),
+        defaults: {
+          checkFrequency: frequency.input.value,
+          expectedStatusCode: overrideValue(status.input.value) || d.expectedStatusCode,
+          timeoutMs: overrideValue(timeout.input.value) || d.timeoutMs,
+          slowThresholdMs: overrideValue(slow.input.value) || d.slowThresholdMs,
+          amberAfterFailures: overrideValue(amber.input.value) || d.amberAfterFailures,
+          redAfterFailures: overrideValue(red.input.value) || d.redAfterFailures,
+          expectedBodyContains: body.input.value,
+          showBodySnippetInHistory: snippet.input.checked
+        }
+      };
+      if (update.defaults.redAfterFailures < update.defaults.amberAfterFailures) {
+        error.textContent = 'Red must be at least as many failures as amber.';
+        return;
+      }
+      save.disabled = true;
+      post('update-board', { update: update }).then(function (reply) {
+        save.disabled = false;
+        if (reply.message) { error.textContent = reply.message; return; }
+        apply(reply.data);
+        select(null);
+      });
+    });
+  }
+
+  function paintDetail() {
+    var check = document.getElementById('check');
+    check.hidden = false;
+    if (view === 'add' || view === 'edit') paintForm(view === 'edit' ? selected : null);
+    else if (view === 'settings') paintSettings();
+    else if (selected === null) paintAll();
+    else paintService(selected);
+  }
+
+  function paint() {
+    paintRail();
+    paintNotice();
+    document.getElementById('edit').hidden = true;
+    paintDetail();
+    // One button, two jobs: it checks whatever is on screen, which is the whole board on All and
+    // one service otherwise.
+    document.getElementById('check-label').textContent =
+      checking ? 'Checking…' : (selected === null ? 'Check all' : 'Check now');
+    document.getElementById('check').disabled = checking || data.total === 0;
+    document.getElementById('foot').textContent =
+      data.total ? 'Checks run ' + data.frequency : '';
+  }
+
+  function select(id) {
+    selected = id;
+    view = 'list';
+    paint();
+  }
+
+  function show(next) {
+    view = next;
+    paint();
+  }
+
+  /** Re-reads the board and repaints; used after a mutation, which never returns the overview. */
+  function refresh() {
+    return post('poll').then(function (reply) {
+      if (reply.data) { data = reply.data; lastSignature = signature(data); paint(); }
+    });
+  }
+
+  function paintNotice() {
+    var notice = document.getElementById('notice');
+    notice.textContent = '';
+    if (!data.undo) { notice.hidden = true; return; }
+    notice.hidden = false;
+    notice.appendChild(el('span', null, 'Deleted ' + data.undo + '.'));
+    var undo = el('button', null, 'Undo');
+    undo.type = 'button';
+    undo.addEventListener('click', function () {
+      post('undo-delete').then(function (reply) {
+        if (reply.message) return;
+        if (reply.data) { data = reply.data; lastSignature = signature(data); }
+        selected = reply.id || null;
+        view = 'list';
+        paint();
+      });
+    });
+    notice.appendChild(undo);
+    notice.hidden = false;
+  }
+
+  /* ── refresh ─────────────────────────────────────────────────────────── */
+
+  function signature(d) {
+    var parts = [d.boardName, d.total, d.failing, d.slow, d.frequency, d.undo,
+                 JSON.stringify(d.defaults)];
+    for (var i = 0; i < d.services.length; i++) {
+      var s = d.services[i];
+      parts.push(s.id, s.name, s.state, s.lastCheckedAt, s.checks);
+      parts.push(JSON.stringify(d.configs[i] || null));
+    }
+    return parts.join('|');
+  }
+  var lastSignature = signature(data);
+
+  function apply(next) {
+    if (!next) return;
+    var changed = signature(next) !== lastSignature;
+    data = next;
+    lastSignature = signature(next);
+    if (!changed) return;
+    /*
+     * A form owns the pane for as long as it is open.
+     *
+     * The board keeps polling underneath it — a check landing every few seconds changes the
+     * data, and repainting on that would rebuild the form and throw away whatever has been
+     * typed into it. The rail and the notice still update, so the window stays live around the
+     * edges.
+     */
+    if (view !== 'list') {
+      paintRail();
+      paintNotice();
+      return;
+    }
+    paint();
+  }
+
+  var checking = false;
+  function runCheck() {
+    if (checking || data.total === 0) return;
+    checking = true;
+    var button = document.getElementById('check');
+    var label = document.getElementById('check-label');
+    button.disabled = true;
+    label.textContent = 'Checking…';
+    var request = selected === null
+      ? post('check-all')
+      : post('check-service', { id: selected });
+    request.then(function (reply) {
+      apply(reply.data);
+    }).then(function () {
+      checking = false;
+      button.disabled = false;
+      label.textContent = selected === null ? 'Check all' : 'Check now';
+    });
+  }
+
+  document.getElementById('check').addEventListener('click', runCheck);
+  document.getElementById('edit').addEventListener('click', function () { show('edit'); });
+  document.getElementById('add').addEventListener('click', function () {
+    if (data.total >= data.capacity) return;
+    show('add');
+  });
+  document.getElementById('settings').addEventListener('click', function () { show('settings'); });
+
+  /** Whether the keystroke belongs to a field the user is typing in. */
+  function isTyping(e) {
+    var target = e.target;
+    if (!target) return false;
+    var tag = (target.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'select' || tag === 'textarea' || target.isContentEditable;
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') {
+      // In a form, Escape cancels the form rather than the window: closing the whole board
+      // because someone backed out of an edit is not what that key means here.
+      if (view !== 'list') { select(selected); return; }
+      post('close');
+      window.close();
+      return;
+    }
+    /*
+     * Bare-letter shortcuts stop at the edge of a text field.
+     *
+     * Without this, typing a name containing "r" ran a round of checks — and the data that came
+     * back repainted the pane, rebuilding the form and discarding what had been typed. Any
+     * unmodified letter bound as a shortcut has this failure mode the moment a page grows a
+     * field.
+     */
+    if (isTyping(e)) return;
+    if ((e.key === 'r' || e.key === 'R') && !e.metaKey && !e.ctrlKey) runCheck();
+  });
+
+  setInterval(function () {
+    if (checking) return;
+    post('poll').then(function (reply) { apply(reply.data); });
+  }, POLL_MS);
+
+  var lastPing = 0;
+  function touch() {
+    var now = Date.now();
+    if (now - lastPing < 5000) return;
+    lastPing = now;
+    post('ping');
+  }
+  document.addEventListener('keydown', touch, true);
+  document.addEventListener('pointerdown', touch, true);
+  document.addEventListener('wheel', touch, true);
+
+  window.addEventListener('beforeunload', function () { post('close'); });
+
+  paint();
+})();
+</script>
+</body>
+</html>`;
+}
+/** Shows the board window and resolves when it closes. */
+async function showBoardWindow(hostPath, options) {
+    return serveWindow(hostPath, {
+        width: options.width ?? WINDOW_WIDTH,
+        height: options.height ?? WINDOW_HEIGHT,
+        timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        onWarn: options.onWarn,
+        onOpen: options.onOpen,
+        renderPage: (token) => renderBoardHtml(options.getOverview(), token, {
+            width: options.width ?? WINDOW_WIDTH,
+            height: options.height ?? WINDOW_HEIGHT,
+        }),
+        /**
+         * The frame's page. Answered only for a service the board actually holds — the same rule the
+         * picker follows for icons, so the page cannot ask for something it is not showing.
+         */
+        renderRoute: (pathname, params) => {
+            if (pathname !== "/service")
+                return null;
+            const id = params.get("id");
+            if (!id || !options.getServicePage)
+                return null;
+            return options.getServicePage(id, params.get("t") ?? "");
+        },
+        onMessage: async (message) => {
+            if (message.type === "poll") {
+                // A scoped poll comes from the embedded service view, not from the board itself.
+                if (typeof message.scope === "string") {
+                    const snapshot = options.getServiceSnapshot?.(message.scope);
+                    return snapshot ? { data: snapshot } : {};
+                }
+                return { data: options.getOverview() };
+            }
+            if (message.type === "check-all") {
+                await runSafely(options.onCheckAll?.(), options.onWarn, "board check");
+                return { data: options.getOverview() };
+            }
+            if (message.type === "check-service" && typeof message.id === "string") {
+                await runSafely(options.onCheckService?.(message.id), options.onWarn, "service check");
+                return { data: options.getOverview() };
+            }
+            /*
+             * Mutations report a failure rather than throwing it away: the message goes back to the
+             * form, which keeps what was typed. Only a genuinely unknown message falls through.
+             */
+            if (message.type === "add-service" && options.onAddService) {
+                const id = await options.onAddService(message.draft);
+                return { data: options.getOverview(), id };
+            }
+            if (message.type === "update-service"
+                && typeof message.id === "string" && options.onUpdateService) {
+                await options.onUpdateService(message.id, message.draft);
+                return { data: options.getOverview() };
+            }
+            if (message.type === "delete-service"
+                && typeof message.id === "string" && options.onDeleteService) {
+                await options.onDeleteService(message.id);
+                return { data: options.getOverview() };
+            }
+            if (message.type === "undo-delete" && options.onUndoDelete) {
+                const id = await options.onUndoDelete();
+                return { data: options.getOverview(), id };
+            }
+            if (message.type === "move-service"
+                && typeof message.id === "string" && typeof message.delta === "number"
+                && options.onMoveService) {
+                await options.onMoveService(message.id, message.delta);
+                return { data: options.getOverview() };
+            }
+            if (message.type === "update-board" && options.onUpdateBoard) {
+                await options.onUpdateBoard(message.update);
+                return { data: options.getOverview() };
+            }
+            return {};
+        },
+    });
+}
+/** A failed check leaves the window up: the state it reports is already visible on the board. */
+async function runSafely(work, warn, label) {
+    if (!work)
+        return;
+    try {
+        await work;
+    }
+    catch (error) {
+        warn?.(`${label} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+
+/**
+ * Health Board — up to twelve services on one key.
+ *
+ * Shares every piece of checking logic with the single-endpoint action: a service is flattened
+ * onto the board's defaults into exactly the settings shape `runHealthCheck` and
+ * `evaluateButtonState` already take. What is new here is the round — a whole board on one timer
+ * — and the key face, which is generated rather than picked off disk.
+ */
+const LONG_PRESS_MS = 500;
+const INITIAL_CHECK_DELAY_MS = 1500;
+/**
+ * Gap between services within a round.
+ *
+ * A board's worth of simultaneous requests is not a load problem, but it is a spike in whatever
+ * the endpoints report, and it makes a round indivisible: staggering means the key fills in cell
+ * by cell, so a slow service is visible as a cell that has not turned yet rather than as a frozen
+ * key.
+ *
+ * At the cap this spreads a round over roughly five seconds before any response time is counted,
+ * so it is the figure to revisit if the shortest check frequency ever comes down.
+ */
+const STAGGER_MS = 300;
+let HealthBoardAction = (() => {
+    let _classDecorators = [action({ UUID: "com.glenmorgan.pulsedeck.healthboard" })];
+    let _classDescriptor;
+    let _classExtraInitializers = [];
+    let _classThis;
+    let _classSuper = SingletonAction;
+    (class extends _classSuper {
+        static { _classThis = this; }
+        static {
+            const _metadata = typeof Symbol === "function" && Symbol.metadata ? Object.create(_classSuper[Symbol.metadata] ?? null) : void 0;
+            __esDecorate(null, _classDescriptor = { value: _classThis }, _classDecorators, { kind: "class", name: _classThis.name, metadata: _metadata }, null, _classExtraInitializers);
+            _classThis = _classDescriptor.value;
+            if (_metadata) Object.defineProperty(_classThis, Symbol.metadata, { enumerable: true, configurable: true, writable: true, value: _metadata });
+            __runInitializers(_classThis, _classExtraInitializers);
+        }
+        instances = new Map();
+        // ── Lifecycle ────────────────────────────────────────────────────────────
+        async onWillAppear(ev) {
+            if (!ev.action.isKey())
+                return;
+            const keyAction = ev.action;
+            const instance = {
+                settings: mergeBoardSettings(ev.payload.settings),
+                keyDownAt: null,
+                timer: null,
+                inFlight: new Set(),
+                roundRunning: false,
+                saveTimer: null,
+                windowOpen: false,
+                closeWindow: null,
+                lastDeleted: null,
+            };
+            this.instances.set(keyAction.id, instance);
+            await this.drawKey(keyAction, instance);
+            if (instance.settings.services.length > 0) {
+                setTimeout(() => void this.runRound(keyAction.id, keyAction), INITIAL_CHECK_DELAY_MS);
+            }
+            this.resetTimer(keyAction.id, keyAction);
+        }
+        async onWillDisappear(ev) {
+            const instance = this.instances.get(ev.action.id);
+            if (!instance)
+                return;
+            clearTimer(instance.timer);
+            if (instance.saveTimer)
+                clearTimeout(instance.saveTimer);
+            // A window outlives its key otherwise, polling a board that has stopped moving.
+            instance.closeWindow?.();
+            this.instances.delete(ev.action.id);
+        }
+        async onDidReceiveSettings(ev) {
+            if (!ev.action.isKey())
+                return;
+            const instance = this.instances.get(ev.action.id);
+            if (!instance)
+                return;
+            // A round in flight owns the runtime it is about to write; taking settings from underneath it
+            // would lose the results of checks that have already run.
+            if (instance.roundRunning)
+                return;
+            instance.settings = mergeBoardSettings(ev.payload.settings);
+            this.resetTimer(ev.action.id, ev.action);
+            await this.drawKey(ev.action, instance);
+        }
+        // ── Key press ────────────────────────────────────────────────────────────
+        onKeyDown(ev) {
+            const instance = this.instances.get(ev.action.id);
+            if (instance)
+                instance.keyDownAt = Date.now();
+        }
+        async onKeyUp(ev) {
+            if (!ev.action.isKey())
+                return;
+            const instance = this.instances.get(ev.action.id);
+            if (!instance)
+                return;
+            const held = instance.keyDownAt !== null ? Date.now() - instance.keyDownAt : 0;
+            instance.keyDownAt = null;
+            // An empty board has nothing to check, so the short press goes where the services are added.
+            if (held >= LONG_PRESS_MS || instance.settings.services.length === 0) {
+                // Not awaited: the window stays open until it is closed, and awaiting it here would hold
+                // the key's event handler for as long as someone is reading it.
+                void this.openManager(ev.action.id, ev.action);
+                return;
+            }
+            await this.runRound(ev.action.id, ev.action);
+        }
+        /**
+         * Opens the manager window, working down the available hosts.
+         *
+         * A host can be present yet fail to launch, so a failure tries the next one rather than being
+         * mistaken for the user closing the window. Unlike the history window there is no osascript
+         * fallback: a dialog cannot manage a list, and pretending otherwise would be worse than saying
+         * plainly that no window host is available.
+         */
+        async openManager(id, keyAction) {
+            const instance = this.instances.get(id);
+            if (!instance)
+                return;
+            if (instance.windowOpen)
+                return;
+            instance.windowOpen = true;
+            try {
+                for (const host of await findHosts()) {
+                    try {
+                        await showBoardWindow(host, {
+                            getOverview: () => buildBoardOverview(instance.settings, instance.lastDeleted?.service.name ?? null),
+                            onCheckAll: () => this.runRound(id, keyAction),
+                            onCheckService: async (serviceId) => {
+                                await this.checkService(keyAction, instance, serviceId);
+                                await this.persist(keyAction, instance);
+                            },
+                            // The selected service's pane is the history window's own page, embedded. Both
+                            // windows render the same view from the same snapshot rather than each having one.
+                            getServicePage: (serviceId, token) => {
+                                const snapshot = this.snapshotFor(instance, serviceId);
+                                if (!snapshot)
+                                    return null;
+                                return renderHistoryHtml(snapshot, token, {
+                                    canCheck: false,
+                                    embedded: true,
+                                    scope: serviceId,
+                                });
+                            },
+                            getServiceSnapshot: (serviceId) => this.snapshotFor(instance, serviceId),
+                            onAddService: async (draft) => {
+                                if (instance.settings.services.length >= BOARD_CAPACITY) {
+                                    throw new Error(`A board holds ${BOARD_CAPACITY} services.`);
+                                }
+                                const service = {
+                                    ...newService(String(draft.name ?? ""), String(draft.url ?? "")),
+                                    ...draft,
+                                    id: newServiceId(),
+                                };
+                                instance.settings.services.push(service);
+                                instance.settings.runtime[service.id] = { ...EMPTY_RUNTIME };
+                                await this.afterMutation(keyAction, instance);
+                                // Checked straight away rather than waiting for the next round: adding a service is
+                                // exactly when you want to know whether the URL was right.
+                                void this.checkService(keyAction, instance, service.id)
+                                    .then(() => this.persist(keyAction, instance));
+                                return service.id;
+                            },
+                            onUpdateService: async (serviceId, draft) => {
+                                const index = instance.settings.services.findIndex((s) => s.id === serviceId);
+                                if (index < 0)
+                                    throw new Error("That service is no longer on this board.");
+                                const existing = instance.settings.services[index];
+                                instance.settings.services[index] = { ...existing, ...draft, id: existing.id };
+                                await this.afterMutation(keyAction, instance);
+                                void this.checkService(keyAction, instance, serviceId)
+                                    .then(() => this.persist(keyAction, instance));
+                            },
+                            onDeleteService: async (serviceId) => {
+                                const index = instance.settings.services.findIndex((s) => s.id === serviceId);
+                                if (index < 0)
+                                    return;
+                                const [service] = instance.settings.services.splice(index, 1);
+                                const runtime = runtimeFor(instance.settings, serviceId);
+                                delete instance.settings.runtime[serviceId];
+                                instance.lastDeleted = { index, service, runtime };
+                                await this.afterMutation(keyAction, instance);
+                            },
+                            onUndoDelete: async () => {
+                                const held = instance.lastDeleted;
+                                if (!held)
+                                    throw new Error("There is nothing to undo.");
+                                if (instance.settings.services.length >= BOARD_CAPACITY) {
+                                    throw new Error("The board is full; remove a service before restoring one.");
+                                }
+                                // Back where it was, so the grid position it had is the position it gets.
+                                instance.settings.services.splice(held.index, 0, held.service);
+                                instance.settings.runtime[held.service.id] = held.runtime;
+                                instance.lastDeleted = null;
+                                await this.afterMutation(keyAction, instance);
+                                return held.service.id;
+                            },
+                            onMoveService: async (serviceId, delta) => {
+                                const services = instance.settings.services;
+                                const from = services.findIndex((s) => s.id === serviceId);
+                                const to = from + delta;
+                                if (from < 0 || to < 0 || to >= services.length)
+                                    return;
+                                const [moved] = services.splice(from, 1);
+                                services.splice(to, 0, moved);
+                                await this.afterMutation(keyAction, instance);
+                            },
+                            onUpdateBoard: async (update) => {
+                                const frequencyChanged = update.defaults?.checkFrequency !== undefined
+                                    && update.defaults.checkFrequency !== instance.settings.defaults.checkFrequency;
+                                if (typeof update.boardName === "string") {
+                                    instance.settings.boardName = update.boardName.trim() || "Health board";
+                                }
+                                if (update.defaults) {
+                                    instance.settings.defaults = { ...instance.settings.defaults, ...update.defaults };
+                                }
+                                await this.afterMutation(keyAction, instance);
+                                // The round's clock is the board's, so a changed frequency has to restart it.
+                                if (frequencyChanged)
+                                    this.resetTimer(id, keyAction);
+                            },
+                            onOpen: (close) => { instance.closeWindow = close; },
+                            onWarn: (message) => streamDeck.logger.warn(message),
+                        });
+                        return;
+                    }
+                    catch (error) {
+                        streamDeck.logger.warn("Board window host unavailable, trying the next one:", error);
+                    }
+                }
+                streamDeck.logger.error("No window host available: the board cannot be managed without one. Build the native "
+                    + "host with npm run build:native, or install a Chromium-family browser.");
+            }
+            finally {
+                instance.windowOpen = false;
+                instance.closeWindow = null;
+            }
+        }
+        /**
+         * What every mutation owes: a redrawn key and a write.
+         *
+         * The key is the only thing most people look at, so it must not lag a change made in the
+         * window, and the write is debounced so a burst of edits costs one save rather than five.
+         */
+        async afterMutation(keyAction, instance) {
+            await this.drawKey(keyAction, instance);
+            await this.persist(keyAction, instance);
+        }
+        /** One service as the single-endpoint modules see it, or null if the board has no such id. */
+        snapshotFor(instance, serviceId) {
+            const service = instance.settings.services.find((s) => s.id === serviceId);
+            if (!service)
+                return null;
+            return buildSnapshot(resolveService(instance.settings.defaults, service, runtimeFor(instance.settings, serviceId)));
+        }
+        // ── Inspector messages ───────────────────────────────────────────────────
+        /**
+         * Temporary bridge for adding and removing services until the manager window exists.
+         *
+         * The inspector will end up holding a single button, so nothing here is meant to last; it is
+         * what makes the board testable end to end in the meantime.
+         */
+        async onSendToPlugin(ev) {
+            if (!ev.action.isKey())
+                return;
+            const keyAction = ev.action;
+            const instance = this.instances.get(keyAction.id);
+            if (!instance)
+                return;
+            const payload = ev.payload;
+            if (payload.event === "addService" && typeof payload.url === "string") {
+                if (instance.settings.services.length >= BOARD_CAPACITY) {
+                    streamDeck.logger.warn(`board is full; ${BOARD_CAPACITY} services is the cap`);
+                    return;
+                }
+                const service = newService(payload.name?.trim() || hostOf(payload.url), payload.url.trim());
+                instance.settings.services.push(service);
+                instance.settings.runtime[service.id] = { ...EMPTY_RUNTIME };
+                await this.persist(keyAction, instance);
+                await this.drawKey(keyAction, instance);
+                this.resetTimer(keyAction.id, keyAction);
+                await this.checkService(keyAction, instance, service.id);
+                return;
+            }
+            if (payload.event === "removeLast") {
+                const gone = instance.settings.services.pop();
+                if (gone)
+                    delete instance.settings.runtime[gone.id];
+                await this.persist(keyAction, instance);
+                await this.drawKey(keyAction, instance);
+                return;
+            }
+            if (payload.event === "checkAll") {
+                await this.runRound(keyAction.id, keyAction);
+            }
+        }
+        // ── Checking ─────────────────────────────────────────────────────────────
+        /**
+         * One pass over every service, staggered.
+         *
+         * The key is redrawn as each result lands rather than once at the end, so a round is visible as
+         * it happens. Settings are written once, after the whole round: nine services measured 60–80KB
+         * of settings, so a full board is more than twice that, and persisting per check would rewrite
+         * all of it once per service.
+         */
+        async runRound(id, keyAction) {
+            const instance = this.instances.get(id);
+            if (!instance || instance.roundRunning)
+                return;
+            if (instance.settings.services.length === 0)
+                return;
+            instance.roundRunning = true;
+            try {
+                const ids = instance.settings.services.map((service) => service.id);
+                for (let i = 0; i < ids.length; i++) {
+                    if (i > 0)
+                        await delay(STAGGER_MS);
+                    // Not awaited: a slow service must not hold up the rest of the round, and each result
+                    // redraws the key as it arrives.
+                    void this.checkService(keyAction, instance, ids[i]);
+                }
+                // Let the last request finish before persisting, so the round is written whole.
+                await this.settle(instance);
+                await this.persist(keyAction, instance);
+            }
+            finally {
+                instance.roundRunning = false;
+            }
+        }
+        async checkService(keyAction, instance, serviceId) {
+            const service = instance.settings.services.find((s) => s.id === serviceId);
+            if (!service)
+                return;
+            // A service still answering from the last round is skipped rather than queued: two checks of
+            // the same endpoint in flight would write two records for one interval.
+            if (instance.inFlight.has(serviceId))
+                return;
+            const runtime = runtimeFor(instance.settings, serviceId);
+            const resolved = resolveService(instance.settings.defaults, service, runtime);
+            if (validateSettings(resolved)) {
+                runtime.currentState = "config-error";
+                instance.settings.runtime[serviceId] = runtime;
+                await this.drawKey(keyAction, instance);
+                return;
+            }
+            instance.inFlight.add(serviceId);
+            runtime.currentState = "checking";
+            instance.settings.runtime[serviceId] = runtime;
+            await this.drawKey(keyAction, instance);
+            try {
+                const result = await runHealthCheck(resolved);
+                const failures = result.ok ? 0 : runtime.consecutiveFailures + 1;
+                const record = buildCheckRecord(result, evaluateButtonState(resolved, failures, buildCheckRecord(result, "unknown")));
+                instance.settings.runtime[serviceId] = {
+                    history: appendRecord(runtime.history, record),
+                    currentState: record.state,
+                    consecutiveFailures: failures,
+                    lastCheckedAt: record.timestamp,
+                    lastStatusCode: result.statusCode,
+                    lastResponseTimeMs: result.responseTimeMs,
+                };
+            }
+            finally {
+                instance.inFlight.delete(serviceId);
+            }
+            await this.drawKey(keyAction, instance);
+        }
+        /** Waits for the round's requests to land, bounded so one hung service cannot stall the save. */
+        async settle(instance) {
+            const deadline = Date.now() + 30_000;
+            while (instance.inFlight.size > 0 && Date.now() < deadline)
+                await delay(100);
+        }
+        // ── Persistence and drawing ──────────────────────────────────────────────
+        /** Debounced, so a manual check during a round does not write the whole board twice. */
+        async persist(keyAction, instance) {
+            if (instance.saveTimer)
+                clearTimeout(instance.saveTimer);
+            instance.saveTimer = setTimeout(() => {
+                instance.saveTimer = null;
+                void keyAction.setSettings(instance.settings);
+            }, 250);
+        }
+        async drawKey(keyAction, instance) {
+            await keyAction.setImage(renderBoardIcon(boardCells(instance.settings)));
+        }
+        resetTimer(id, keyAction) {
+            const instance = this.instances.get(id);
+            if (!instance)
+                return;
+            clearTimer(instance.timer);
+            instance.timer = null;
+            const intervalMs = getIntervalMs(instance.settings.defaults.checkFrequency);
+            if (intervalMs !== null) {
+                instance.timer = startTimer(intervalMs, () => void this.runRound(id, keyAction));
+            }
+        }
+    });
+    return _classThis;
+})();
+function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+/** A URL is a reasonable name until someone types a better one. */
+function hostOf(url) {
+    try {
+        return new URL(url.trim()).hostname;
+    }
+    catch {
+        return "New service";
+    }
+}
+
 streamDeck.actions.registerAction(new HealthCheckAction());
+streamDeck.actions.registerAction(new HealthBoardAction());
 streamDeck.connect();

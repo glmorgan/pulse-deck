@@ -1,12 +1,5 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { access, chmod } from "node:fs/promises";
-import { constants } from "node:fs";
-import { type AddressInfo } from "node:net";
-import { platform } from "node:os";
-
 import type { HistorySnapshot } from "./snapshot.js";
+import { findHosts, serveWindow } from "./windowHost.js";
 
 /**
  * A real window for the long-press history, in place of the osascript dialog.
@@ -14,6 +7,7 @@ import type { HistorySnapshot } from "./snapshot.js";
  * The shape is the one described in quick-clips/docs/native-picker.md: the plugin serves a page
  * on an ephemeral 127.0.0.1 port and spawns a native host that shows it in a WKWebView, falling
  * back to a Chromium `--app=` window and finally to the osascript dialog the caller already has.
+ * The plumbing for all of that lives in `windowHost`, which the board window shares.
  *
  * The plugin never talks to the host after spawning it. The page polls this server for a fresh
  * snapshot, so a background check that lands while the window is open shows up without anything
@@ -35,29 +29,8 @@ export type HistoryWindowOptions = {
   height?: number;
 };
 
-/** Thrown when a host could not display anything — try the next one, do not treat as a close. */
-export class HistoryWindowLaunchError extends Error {}
-
-/** Bundled native host, relative to the sdPlugin root (the plugin's working directory). */
-const NATIVE_HOST = "bin/pulse-host";
-
-/** Chromium-family browsers that support `--app=` windows, in preference order. */
-const BROWSER_CANDIDATES: Record<string, string[]> = {
-  darwin: [
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-  ],
-  // The native host is macOS-only and the osascript fallback does not exist on Windows, so a
-  // browser is the *only* way this feature works there — worth the four paths.
-  win32: [
-    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-  ],
-};
+/** Re-exported so callers keep importing their window's own module rather than the plumbing. */
+export { findHosts };
 
 /** Content-area size. Wide enough for 60 columns at a readable width, tall enough for both cards. */
 const WINDOW_WIDTH = 900;
@@ -69,50 +42,8 @@ const VERTICAL_BIAS = 0.35;
  * page's own polling would otherwise hold it open forever, which is how an orphan window happens.
  */
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
-/**
- * A host that never asked for the page has failed, even if its process is still alive — a binary
- * macOS refuses to run can hang rather than exit, which is indistinguishable from a slow launch
- * until you notice nothing was ever requested.
- */
-const PAGE_LOAD_TIMEOUT_MS = 6_000;
 /** How often the page asks for a fresh snapshot. Fast enough to feel live, cheap enough to ignore. */
 const POLL_MS = 2_000;
-
-/**
- * Returns every command capable of showing the window, best first.
- *
- * All of them rather than the best one, because a host can be present yet unlaunchable — an
- * unsigned native host that Gatekeeper quarantined is the usual case — and the caller works down
- * the list before giving up on the window entirely.
- */
-export async function findHosts(): Promise<string[]> {
-  const hosts: string[] = [];
-  try {
-    await access(NATIVE_HOST, constants.X_OK);
-    hosts.push(NATIVE_HOST);
-  } catch {
-    // `streamdeck pack` stores no permission bits, so the host arrives from a packaged install
-    // without its exec bit. plugin.js is unaffected because Stream Deck runs it as an argument
-    // to node. Repair the bit rather than falling back to a browser on every packaged install.
-    try {
-      await access(NATIVE_HOST, constants.F_OK);
-      await chmod(NATIVE_HOST, 0o755);
-      await access(NATIVE_HOST, constants.X_OK);
-      hosts.push(NATIVE_HOST);
-    } catch {
-      // Not built for this checkout, or not writable — browsers only.
-    }
-  }
-  for (const path of BROWSER_CANDIDATES[platform()] ?? []) {
-    try {
-      await access(path);
-      hosts.push(path);
-    } catch {
-      // Not installed — try the next candidate.
-    }
-  }
-  return hosts;
-}
 
 /**
  * Serialises data for a `<script>` block. `<` must be escaped or a `</script>` inside a body
@@ -163,16 +94,38 @@ const REFRESH_SVG =
 export function renderHistoryHtml(
   snapshot: HistorySnapshot,
   token: string,
-  options: { width?: number; height?: number; canCheck: boolean; pollMs?: number }
+  options: {
+    width?: number;
+    height?: number;
+    canCheck: boolean;
+    pollMs?: number;
+    /**
+     * Rendered inside another window's pane rather than as a window of its own.
+     *
+     * The board shows this view for a selected service, and owns the chrome around it: its own
+     * header names the service and carries the controls, so this page drops its header and
+     * footer and keeps the tiles, the chart and the table. It also stops trying to size a window
+     * it does not own, and stops treating Escape as "close everything".
+     */
+    embedded?: boolean;
+    /** Identifies which service the page is asking about, when embedded in a board. */
+    scope?: string;
+  }
 ): string {
   const winW = options.width ?? WINDOW_WIDTH;
   const winH = options.height ?? WINDOW_HEIGHT;
   const pollMs = options.pollMs ?? POLL_MS;
 
   return `<!doctype html>
-<html lang="en">
+<html lang="en" style="background:#333333">
 <head>
 <meta charset="utf-8" />
+<!--
+  Declared here as well as in the stylesheet: a fresh document paints its base canvas before any
+  CSS is applied, which showed as a white flash each time the board swapped one service's frame
+  for another. The inline background and the colour-scheme hint both land at parse time.
+-->
+<meta name="color-scheme" content="dark" />
 <title>${escapeHtml(snapshot.serviceName)} — PulseDeck</title>
 <script>
 /*
@@ -185,6 +138,7 @@ export function renderHistoryHtml(
  */
 (function () {
   var W = ${winW}, H = ${winH};
+  var EMBEDDED = ${options.embedded ? "true" : "false"};
   var root = document.documentElement;
   var revealed = false;
   function reveal() {
@@ -194,7 +148,9 @@ export function renderHistoryHtml(
   }
   // The native host creates the window already sized and placed, and resizeTo() there would size
   // the *outer* frame and cost the content the height of the title bar.
-  if (window.__nativeHost) { reveal(); return; }
+  // An embedded page is a frame inside someone else's window: there is nothing to size, and
+  // resizeTo would either be ignored or, worse, resize the host window around it.
+  if (window.__nativeHost || EMBEDDED) { reveal(); return; }
   try {
     var chromeW = Math.max(0, window.outerWidth - window.innerWidth);
     var chromeH = Math.max(0, window.outerHeight - window.innerHeight);
@@ -485,10 +441,22 @@ export function renderHistoryHtml(
     display: inline-grid; place-items: center; min-width: 17px; height: 17px; padding: 0 4px;
     background: var(--kbd); border-radius: 4px; font: inherit; font-size: 10px; color: var(--fg-dim);
   }
+${options.embedded ? `
+  /*
+   * Embedded, the host window owns the margins.
+   *
+   * These gutters exist so the page has breathing room against a window edge; inside a pane that
+   * already has its own padding they are a second inset, and the tiles and chart sat short of the
+   * heading above them and the button to their right. The frame is given the width it should
+   * fill, so the page fills it.
+   */
+  .wrap { padding: 0; max-width: none; }
+  main { padding: 0; }
+` : ""}
 </style>
 </head>
 <body>
-<header>
+${options.embedded ? "" : `<header>
   <div class="wrap">
     <div class="id">
       <span class="pill" id="pill"><span class="dot"></span><span id="pill-label"></span></span>
@@ -499,7 +467,7 @@ export function renderHistoryHtml(
       ? `<button id="check">${REFRESH_SVG}<span id="check-label">Check now</span></button>`
       : ""}
   </div>
-</header>
+</header>`}
 
 <main class="wrap">
 <section class="tiles" id="tiles"></section>
@@ -548,7 +516,7 @@ export function renderHistoryHtml(
 </section>
 </main>
 
-<footer>
+${options.embedded ? "" : `<footer>
   <div class="wrap">
     <span id="foot"></span>
     <span class="keys">
@@ -556,7 +524,7 @@ export function renderHistoryHtml(
       <span><kbd>esc</kbd> close</span>
     </span>
   </div>
-</footer>
+</footer>`}
 
 <script>
 (function () {
@@ -564,6 +532,9 @@ export function renderHistoryHtml(
   var TOKEN = ${embedJson(token)};
   var POLL_MS = ${pollMs};
   var CAN_CHECK = ${options.canCheck ? "true" : "false"};
+  var EMBEDDED = ${options.embedded ? "true" : "false"};
+  /** Sent with every message so a board knows which service is asking. */
+  var SCOPE = ${embedJson(options.scope ?? null)};
   var data = ${embedJson(snapshot)};
 
   /* Report page-side failures to the plugin log; a broken render is otherwise silent. */
@@ -573,6 +544,7 @@ export function renderHistoryHtml(
 
   function post(type, extra) {
     var body = { type: type };
+    if (SCOPE !== null) body.scope = SCOPE;
     if (extra) for (var k in extra) body[k] = extra[k];
     return fetch('/message?t=' + encodeURIComponent(TOKEN), {
       method: 'POST',
@@ -636,6 +608,8 @@ export function renderHistoryHtml(
   /* ── header, tiles, table ────────────────────────────────────────────── */
 
   function paintHeader() {
+    // Embedded, the board owns the header and the footer; there is nothing here to paint.
+    if (EMBEDDED) return;
     document.getElementById('name').textContent = data.serviceName;
     var pill = document.getElementById('pill');
     pill.setAttribute('data-state', data.state);
@@ -1176,7 +1150,9 @@ export function renderHistoryHtml(
   }
 
   document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') { post('close'); window.close(); return; }
+    // Embedded, closing is the host window's business: this page's Escape would otherwise
+    // shut the whole board.
+    if (e.key === 'Escape' && !EMBEDDED) { post('close'); window.close(); return; }
     if ((e.key === 'r' || e.key === 'R') && !e.metaKey && !e.ctrlKey) runCheck();
   });
 
@@ -1202,7 +1178,11 @@ export function renderHistoryHtml(
   document.addEventListener('pointerdown', touch, true);
   document.addEventListener('wheel', touch, true);
 
-  window.addEventListener('beforeunload', function () { post('close'); });
+  // Same reasoning: an embedded frame unloads whenever the selection changes, which must not
+  // be reported as the window closing.
+  if (!EMBEDDED) {
+    window.addEventListener('beforeunload', function () { post('close'); });
+  }
   window.addEventListener('resize', function () { paintChart(); });
 
   paint();
@@ -1215,186 +1195,45 @@ export function renderHistoryHtml(
 /**
  * Shows the history window and resolves when it closes.
  *
- * @param hostPath Executable from {@link findHosts}. Spawned directly rather than through `open`,
- * because `open -a` drops `--args` when the browser is already running, which would surface this
- * as an ordinary tab instead of an app window.
+ * The server, the token gate, the host spawn and the launch/close distinction all live in
+ * `windowHost`; what is left here is the page and the two messages this window has of its own.
  */
 export async function showHistoryWindow(
   hostPath: string,
   options: HistoryWindowOptions
 ): Promise<void> {
-  const token = randomBytes(16).toString("hex");
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const warn = options.onWarn ?? (() => { /* caller opted out of diagnostics */ });
-  const width = options.width ?? WINDOW_WIDTH;
-  const height = options.height ?? WINDOW_HEIGHT;
+  return serveWindow(hostPath, {
+    width: options.width ?? WINDOW_WIDTH,
+    height: options.height ?? WINDOW_HEIGHT,
+    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    onWarn: options.onWarn,
+    onOpen: options.onOpen,
+    renderPage: (token) =>
+      renderHistoryHtml(options.getSnapshot(), token, {
+        width: options.width ?? WINDOW_WIDTH,
+        height: options.height ?? WINDOW_HEIGHT,
+        canCheck: !!options.onRunCheck,
+      }),
+    onMessage: async (message) => {
+      // A read, deliberately not an interaction: see the page's comment about the two clocks.
+      if (message.type === "poll") return { data: options.getSnapshot() };
 
-  return new Promise<void>((resolve, reject) => {
-    let settled = false;
-    let child: ChildProcess | undefined;
-    let idleTimer: NodeJS.Timeout | undefined;
-    let loadWatchdog: NodeJS.Timeout | undefined;
-    let pageServed = false;
-
-    const server = createServer(handle);
-
-    function finish(): void {
-      if (settled) return;
-      settled = true;
-      if (idleTimer) clearTimeout(idleTimer);
-      if (loadWatchdog) clearTimeout(loadWatchdog);
-      server.close();
-      // The window owns nothing else, so terminating the host is safe.
-      child?.kill();
-      resolve();
-    }
-
-    /** A host that never displayed anything — the caller should try the next one. */
-    function failLaunch(detail: string): void {
-      if (settled) return;
-      settled = true;
-      if (idleTimer) clearTimeout(idleTimer);
-      if (loadWatchdog) clearTimeout(loadWatchdog);
-      server.close();
-      child?.kill();
-      reject(new HistoryWindowLaunchError(`${hostPath} failed to launch: ${detail}`));
-    }
-
-    function armIdleTimer(): void {
-      if (settled) return;
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(finish, timeoutMs);
-    }
-
-    function sendJson(res: ServerResponse, payload: unknown): void {
-      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(payload));
-    }
-
-    function handle(req: IncomingMessage, res: ServerResponse): void {
-      const url = new URL(req.url ?? "/", "http://127.0.0.1");
-      // Any local process can reach this port, so the token gates every route before any routing.
-      if (url.searchParams.get("t") !== token) {
-        res.writeHead(403).end("forbidden");
-        return;
-      }
-
-      if (url.pathname === "/") {
-        // Proof the host launched and asked for something.
-        pageServed = true;
-        if (loadWatchdog) clearTimeout(loadWatchdog);
-        res.writeHead(200, {
-          "Content-Type": "text/html; charset=utf-8",
-          "Cache-Control": "no-store, no-cache, must-revalidate",
-        }).end(renderHistoryHtml(options.getSnapshot(), token, {
-          width,
-          height,
-          canCheck: !!options.onRunCheck,
-        }));
-        return;
-      }
-
-      if (url.pathname === "/message" && req.method === "POST") {
-        let body = "";
-        req.on("data", (chunk) => { body += chunk; });
-        req.on("end", () => {
-          let parsed: { type?: unknown; message?: unknown };
+      if (message.type === "check") {
+        const run = options.onRunCheck;
+        if (run) {
           try {
-            parsed = JSON.parse(body);
-          } catch {
-            sendJson(res, {});
-            return;
+            await run();
+          } catch (error: unknown) {
+            // The window stays up and shows whatever the key holds; a failed manual check is
+            // already visible as the key's state.
+            options.onWarn?.(`history window check failed: ${
+              error instanceof Error ? error.message : String(error)}`);
           }
-
-          // A read, deliberately not an interaction: see the page's comment about the two clocks.
-          if (parsed.type === "poll") {
-            sendJson(res, { data: options.getSnapshot() });
-            return;
-          }
-
-          if (parsed.type === "ping") {
-            armIdleTimer();
-            sendJson(res, {});
-            return;
-          }
-
-          if (parsed.type === "check") {
-            armIdleTimer();
-            const run = options.onRunCheck;
-            if (!run) {
-              sendJson(res, { data: options.getSnapshot() });
-              return;
-            }
-            run()
-              .catch((error: unknown) => {
-                // The window stays up and shows whatever the key holds; a failed manual check is
-                // already visible as the key's state.
-                warn(`history window check failed: ${
-                  error instanceof Error ? error.message : String(error)}`);
-              })
-              .then(() => { sendJson(res, { data: options.getSnapshot() }); });
-            return;
-          }
-
-          if (parsed.type === "error" && typeof parsed.message === "string") {
-            warn(`history window page error: ${parsed.message}`);
-            sendJson(res, {});
-            return;
-          }
-
-          if (parsed.type === "close") {
-            sendJson(res, {});
-            finish();
-            return;
-          }
-
-          sendJson(res, {});
-        });
-        return;
+        }
+        return { data: options.getSnapshot() };
       }
 
-      res.writeHead(404).end("not found");
-    }
-
-    server.on("error", (error) => failLaunch(error.message));
-
-    server.listen(0, "127.0.0.1", () => {
-      const { port } = server.address() as AddressInfo;
-      const target = `http://127.0.0.1:${port}/?t=${token}`;
-      // Chrome's own flag spelling, which the native host also accepts, so the two are
-      // interchangeable and nothing here needs to know which one it spawned.
-      child = spawn(hostPath, [
-        `--app=${target}`,
-        `--window-size=${width},${height}`,
-        "--no-first-run",
-        "--no-default-browser-check",
-      ], { stdio: ["ignore", "ignore", "pipe"], detached: false });
-
-      // The native host reports its resolved geometry and any page-load failure on stderr.
-      // Discarding it would hide exactly the class of problem that is hardest to diagnose.
-      child.stderr?.on("data", (chunk) => {
-        const text = String(chunk).trim();
-        if (text) warn(text);
-      });
-
-      child.on("error", (error) => failLaunch(error.message));
-
-      // Exit status separates the two very different reasons a host can be gone:
-      //   code 0  — it ran and the window was closed. The page's own close message usually beats
-      //             this, but it can lose the race, and reopening another host would pop a second
-      //             window at someone who just closed one.
-      //   anything else — it never displayed: a quarantined binary killed by the system, or bad
-      //             arguments. Worth trying the next host.
-      child.on("exit", (code, signal) => {
-        if (settled) return;
-        if (code === 0 && !signal) finish();
-        else failLaunch(signal ? `killed by ${signal}` : `exited with code ${code}`);
-      });
-
-      options.onOpen?.(finish);
-      armIdleTimer();
-      loadWatchdog = setTimeout(() => {
-        if (!pageServed) failLaunch(`never requested the page within ${PAGE_LOAD_TIMEOUT_MS}ms`);
-      }, PAGE_LOAD_TIMEOUT_MS);
-    });
+      return {};
+    },
   });
 }

@@ -155,7 +155,20 @@ final class HistoryWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
         guard let area = screen?.visibleFrame else { window.center(); return }
 
-        let frameSize = window.frame.size  // includes the title bar
+        var frameSize = window.frame.size  // includes the title bar
+
+        // A window larger than the display is not merely ugly: the bias below turns negative and
+        // pushes the overflow off the bottom edge, where the rows it holds cannot be reached and
+        // cannot be scrolled to either, because the scroll container is inside the part that is
+        // off screen. Clamping first costs a scrollbar on a small display and nothing on a large
+        // one. `visibleFrame` already excludes the menu bar and the Dock.
+        if frameSize.width > area.width || frameSize.height > area.height {
+            frameSize.width = min(frameSize.width, area.width)
+            frameSize.height = min(frameSize.height, area.height)
+            window.setFrame(NSRect(origin: window.frame.origin, size: frameSize), display: false)
+            log("clamped to screen: \(Int(frameSize.width))x\(Int(frameSize.height))")
+        }
+
         let x = area.midX - frameSize.width / 2
         // AppKit's origin is bottom-left, so a bias measured from the top inverts here.
         let topGap = (area.height - frameSize.height) * verticalBias
@@ -217,19 +230,36 @@ let app = NSApplication.shared
 // feel like a second of loading. Accessory windows can still become key and take keyboard focus.
 app.setActivationPolicy(.accessory)
 
-// AppKit routes the standard shortcuts through menu key equivalents, so without a menu bar
-// Cmd+C and Cmd+W simply do nothing — you could not copy an error message out of the window, or
-// close it the way every other window closes. The menu itself is never shown.
+/*
+ * AppKit routes the standard editing shortcuts through the Edit menu's key equivalents, so
+ * without a menu bar Cmd+V, Cmd+X and Cmd+Z simply do nothing inside a text field — the
+ * keystroke reaches nothing that handles it, and the field sits there unchanged.
+ *
+ * This menu started as Copy and Select All, which was enough while the only window was the
+ * read-only history view. The board's manager window has forms in it, and pasting a URL into one
+ * is the first thing anybody does, so the full set is here now. Undo and Redo are addressed by
+ * name because they are the field editor's own, not NSText's.
+ *
+ * The menu itself is never shown: the window is the only UI.
+ */
 let mainMenu = NSMenu()
 let editItem = NSMenuItem()
 mainMenu.addItem(editItem)
 let editMenu = NSMenu(title: "Edit")
+editMenu.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
+let redo = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+redo.keyEquivalentModifierMask = [.command, .shift]
+editMenu.addItem(redo)
+editMenu.addItem(NSMenuItem.separator())
 for (title, selector, key) in [
+    ("Cut", #selector(NSText.cut(_:)), "x"),
     ("Copy", #selector(NSText.copy(_:)), "c"),
+    ("Paste", #selector(NSText.paste(_:)), "v"),
     ("Select All", #selector(NSText.selectAll(_:)), "a"),
 ] {
     editMenu.addItem(NSMenuItem(title: title, action: selector, keyEquivalent: key))
 }
+editMenu.addItem(NSMenuItem.separator())
 editMenu.addItem(NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
 editItem.submenu = editMenu
 app.mainMenu = mainMenu

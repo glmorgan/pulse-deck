@@ -25,7 +25,16 @@
       "Bash(sips -g pixelWidth -g pixelHeight /Users/glen/Desktop/pulse-deck.png /Users/glen/Desktop/pulse-deck@2x.png)",
       "Bash(sips -g pixelWidth -g pixelHeight /Users/glen/Desktop/marketplace.png /Users/glen/Desktop/marketplace@2x.png)",
       "Bash(cp /Users/glen/Desktop/marketplace.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/plugin/marketplace.png)",
-      "Bash(cp /Users/glen/Desktop/marketplace@2x.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/plugin/marketplace@2x.png)"
+      "Bash(cp /Users/glen/Desktop/marketplace@2x.png /Users/glen/Documents/GitHub/pulse-deck/com.glenmorgan.pulsedeck.sdPlugin/imgs/plugin/marketplace@2x.png)",
+      "Bash(git status *)",
+      "Bash(git tag *)",
+      "Bash(git push *)",
+      "Bash(gh release create v1.0.0 --title 'PulseDeck v1.0.0' --notes ' *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git reset *)",
+      "Bash(npx streamdeck *)",
+      "Bash(gh release create v1.0.0 com.glenmorgan.pulsedeck.streamDeckPlugin --title 'PulseDeck v1.0.0' --notes ' *)"
     ],
     "additionalDirectories": [
       "/Users/glen/Documents/GitHub/quick-clips/com.quickclips.streamdeck.sdPlugin/ui"

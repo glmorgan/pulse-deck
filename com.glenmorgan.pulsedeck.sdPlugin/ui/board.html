@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+
+<head lang="en">
+  <meta charset="utf-8" />
+  <script src="sdpi-components.js"></script>
+</head>
+
+<body>
+  <!--
+    Temporary scaffolding. Health Board's configuration belongs in the manager window; this
+    inspector will end up holding a single "Open manager" button. Until that window exists, these
+    fields are the only way to put services on a board, which is what makes the key testable.
+  -->
+  <sdpi-item label="Name">
+    <sdpi-textfield id="name" placeholder="Optional — defaults to the host"></sdpi-textfield>
+  </sdpi-item>
+
+  <sdpi-item label="URL">
+    <sdpi-textfield id="url" placeholder="https://api.example.com/health"></sdpi-textfield>
+  </sdpi-item>
+
+  <sdpi-item label="Add">
+    <sdpi-button id="add">Add service</sdpi-button>
+  </sdpi-item>
+
+  <sdpi-item label="Check">
+    <sdpi-button id="checkAll">Check all now</sdpi-button>
+  </sdpi-item>
+
+  <sdpi-item label="Remove">
+    <sdpi-button id="removeLast">Remove last service</sdpi-button>
+  </sdpi-item>
+
+  <sdpi-item label="">
+    <sdpi-item-value>
+      Up to twelve services. The key draws one cell per service in the order they were added,
+      in a grid sized to fit them: green healthy, amber slow, red failing, grey not yet checked.
+    </sdpi-item-value>
+  </sdpi-item>
+
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      const send = (event, extra) =>
+        SDPIComponents.streamDeckClient.send('sendToPlugin', { event, ...extra });
+
+      document.getElementById('add').addEventListener('click', () => {
+        const url = document.getElementById('url');
+        const name = document.getElementById('name');
+        if (!url.value) return;
+        send('addService', { url: url.value, name: name.value });
+        // Cleared so the next one can be typed straight in; the plugin owns the list from here.
+        url.value = '';
+        name.value = '';
+      });
+
+      document.getElementById('checkAll')
+        .addEventListener('click', () => send('checkAll'));
+      document.getElementById('removeLast')
+        .addEventListener('click', () => send('removeLast'));
+    });
+  </script>
+</body>
+
+</html>
