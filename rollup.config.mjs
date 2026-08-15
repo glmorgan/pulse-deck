@@ -18,13 +18,21 @@ export default {
   ],
   external: [
     "child_process",
+    "crypto",
     "fs",
-    "path",
+    "fs/promises",
+    "http",
+    "net",
     "os",
+    "path",
     "node:child_process",
+    "node:crypto",
     "node:fs",
-    "node:path",
+    "node:fs/promises",
+    "node:http",
+    "node:net",
     "node:os",
+    "node:path",
     "node:util"
   ]
 };

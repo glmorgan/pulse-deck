@@ -1,4 +1,4 @@
-import {
+import streamDeck, {
   action,
   SingletonAction,
   type DidReceiveSettingsEvent,
@@ -19,6 +19,8 @@ import {
 import { runHealthCheck } from "../modules/healthChecker.js";
 import { appendRecord, formatHistoryPopup } from "../modules/history.js";
 import { showPopup } from "../modules/popup.js";
+import { buildSnapshot } from "../modules/snapshot.js";
+import { findHosts, showHistoryWindow } from "../modules/historyWindow.js";
 import {
   buildCheckRecord,
   evaluateButtonState,
@@ -56,6 +58,7 @@ export class HealthCheckAction extends SingletonAction<HealthCheckSettings> {
       isChecking: false,
       keyDownAt: null,
       timer: null,
+      closeWindow: null,
     };
     this.instances.set(id, instance);
 
@@ -78,6 +81,9 @@ export class HealthCheckAction extends SingletonAction<HealthCheckSettings> {
     const instance = this.instances.get(id);
     if (instance) {
       clearTimer(instance.timer);
+      // A window outlives its key otherwise: the page would keep polling a snapshot that has
+      // stopped moving, and Check now would silently do nothing.
+      instance.closeWindow?.();
       this.instances.delete(id);
     }
   }
@@ -118,15 +124,64 @@ export class HealthCheckAction extends SingletonAction<HealthCheckSettings> {
     instance.keyDownAt = null;
 
     if (pressDuration >= LONG_PRESS_MS) {
+      // Deliberately not awaited: the window stays open until it is closed, and awaiting it here
+      // would hold the key's event handler for as long as someone is reading the chart.
+      void this.openHistory(id, ev.action);
+    } else {
+      await this.triggerCheck(id, ev.action);
+    }
+  }
+
+  // ── History window ────────────────────────────────────────────────────────
+
+  /**
+   * Opens the history window, working down the available hosts.
+   *
+   * A host can be present yet fail to launch — an unsigned native host that Gatekeeper
+   * quarantined is the usual cause — so a failure tries the next one rather than being mistaken
+   * for the user closing the window. With no host at all, the osascript dialog still shows the
+   * same figures as text.
+   */
+  private async openHistory(
+    id: string,
+    keyAction: KeyAction<HealthCheckSettings>
+  ): Promise<void> {
+    const instance = this.instances.get(id);
+    if (!instance) return;
+    // A second long press while the window is up must not open a second copy of it. Claimed
+    // before the first await, since finding a host and starting the server take long enough for
+    // another press to arrive; the real closer replaces this as soon as a host is spawned.
+    if (instance.closeWindow) return;
+    instance.closeWindow = () => { /* opening — nothing to close yet */ };
+
+    try {
+      for (const host of await findHosts()) {
+        try {
+          await showHistoryWindow(host, {
+            // Read from the instance rather than captured settings, so a background check that
+            // lands while the window is open shows up on the next poll.
+            getSnapshot: () => buildSnapshot(instance.settings),
+            onRunCheck: () => this.triggerCheck(id, keyAction),
+            onOpen: (close) => { instance.closeWindow = close; },
+            onWarn: (message) => streamDeck.logger.warn(message),
+          });
+          return;
+        } catch (error) {
+          streamDeck.logger.warn("History window host unavailable, trying the next one:", error);
+        }
+      }
+
+      streamDeck.logger.info("No window host available; falling back to the osascript dialog");
       const text = formatHistoryPopup(
         instance.settings.serviceName,
         instance.settings.currentState,
         instance.settings.consecutiveFailures,
         instance.settings.history
       );
+      // execSync blocks the plugin's event loop, so it must not run in the key handler's turn.
       setTimeout(() => showPopup(text), 0);
-    } else {
-      await this.triggerCheck(id, ev.action);
+    } finally {
+      instance.closeWindow = null;
     }
   }
 

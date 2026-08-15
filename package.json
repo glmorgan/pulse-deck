@@ -5,10 +5,14 @@
   "private": true,
   "scripts": {
     "build": "rollup -c rollup.config.mjs",
+    "build:native": "bash native/build.sh",
     "watch": "rollup -c rollup.config.mjs --watch",
     "build:dev": "rollup -c rollup.config.mjs --sourcemap",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "pack": "streamdeck pack com.glenmorgan.pulsedeck.sdPlugin --force",
+    "release": "npm run typecheck && npm test && npm run build && npm run build:native && npm run pack"
   },
   "dependencies": {
     "@elgato/streamdeck": "^2.1.0"

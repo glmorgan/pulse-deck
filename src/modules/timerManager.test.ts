@@ -10,6 +10,10 @@ describe("getIntervalMs", () => {
     expect(getIntervalMs("1m")).toBe(60_000);
   });
 
+  it("returns 300000 for 5m frequency", () => {
+    expect(getIntervalMs("5m")).toBe(300_000);
+  });
+
   it("returns 600000 for 10m frequency", () => {
     expect(getIntervalMs("10m")).toBe(600_000);
   });

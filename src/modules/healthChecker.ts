@@ -3,6 +3,27 @@ import type { CheckResult } from "./stateEvaluator.js";
 
 const MAX_BODY_SNIPPET = 500;
 
+/**
+ * Turns a thrown fetch error into something worth reading in the history.
+ *
+ * Node's fetch reports every transport failure as `TypeError: fetch failed` and puts the actual
+ * reason on `cause` — so a refused connection, an unresolvable host and an expired certificate
+ * all arrive looking identical. Reading the cause is the difference between "fetch failed" and
+ * "connect ECONNREFUSED 10.0.0.1:443", which is the whole value of the column it lands in.
+ */
+export function describeFetchError(err: unknown): string {
+  if (!(err instanceof Error)) return "Unknown error";
+  const cause = (err as { cause?: unknown }).cause;
+  const detail =
+    cause instanceof Error ? cause.message
+    : typeof cause === "string" ? cause
+    : null;
+  if (!detail) return err.message;
+  // "fetch failed" carries no information of its own, so the cause replaces it rather than
+  // trailing it. Anything more specific keeps both halves.
+  return err.message === "fetch failed" ? detail : `${err.message}: ${detail}`;
+}
+
 export async function runHealthCheck(
   settings: HealthCheckSettings
 ): Promise<CheckResult> {
@@ -81,9 +102,7 @@ export async function runHealthCheck(
       bodySnippet: null,
       error: isAbort
         ? `Request timed out after ${settings.timeoutMs}ms`
-        : err instanceof Error
-          ? err.message
-          : "Unknown error",
+        : describeFetchError(err),
     };
   }
 }

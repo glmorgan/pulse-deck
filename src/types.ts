@@ -9,7 +9,7 @@ export type ButtonState =
   | "down"
   | "config-error";
 
-export type CheckFrequency = "manual" | "1m" | "10m" | "30m" | "1h";
+export type CheckFrequency = "manual" | "1m" | "5m" | "10m" | "30m" | "1h";
 
 export interface CheckRecord {
   [key: string]: JsonValue;
@@ -69,4 +69,6 @@ export interface KeyInstance {
   isChecking: boolean;
   keyDownAt: number | null;
   timer: ReturnType<typeof setInterval> | null;
+  /** Dismisses this key's open history window; null when no window is up. */
+  closeWindow: (() => void) | null;
 }

@@ -3,6 +3,7 @@ import type { CheckFrequency } from "../types.js";
 const FREQUENCY_MS: Record<CheckFrequency, number | null> = {
   manual: null,
   "1m": 60_000,
+  "5m": 300_000,
   "10m": 600_000,
   "30m": 1_800_000,
   "1h": 3_600_000,

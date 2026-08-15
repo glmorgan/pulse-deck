@@ -1,4 +1,5 @@
 import type { CheckRecord } from "../types.js";
+import { stateLabel } from "./snapshot.js";
 
 const MAX_HISTORY = 60;
 
@@ -53,7 +54,7 @@ export function formatHistoryPopup(
   const lines: string[] = [
     `PulseDeck: ${name}`,
     "",
-    `Current: ${formatState(currentState)}`,
+    `Current: ${stateLabel(currentState)}`,
     `Last check: ${lastCheckLine}`,
     `Uptime: ${uptimeRatio(history)}`,
     `Average latency: ${avgMs !== null ? `${avgMs}ms` : "N/A"}`,
@@ -76,17 +77,4 @@ export function formatHistoryPopup(
   }
 
   return lines.join("\n");
-}
-
-function formatState(state: string): string {
-  const map: Record<string, string> = {
-    unknown: "Unknown",
-    checking: "Checking",
-    healthy: "Healthy",
-    slow: "Slow",
-    warning: "Warning",
-    down: "Down",
-    "config-error": "Configuration Error",
-  };
-  return map[state] ?? state;
 }
