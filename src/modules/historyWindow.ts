@@ -197,16 +197,11 @@ export function renderHistoryHtml(
     --shadow-lift: 0 6px 18px rgba(0,0,0,.45);
     --accent: #6d9eeb;
 
-    /*
-     * Chart marks. Response time is one series and takes the picker's own accent; slow and
-     * failed are status colours, which mean a state and are never used for a series. Same three
-     * hues validated earlier for colour-blind separation — this blue is a lighter step of it,
-     * so it clears the darker card surface by more, not less.
-     */
-    --ok: var(--accent);
+    /* Chart marks. Healthy is the same green as the key and the state pill. */
+    --ok: var(--good);
     --slow: #fab219;
     --fail: #d03b3b;
-    --good: #4cc94c;
+    --good: #29bd50;
     --serious: #ec835a;
   }
 

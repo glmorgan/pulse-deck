@@ -63,7 +63,7 @@ const EMPTY_GRID = { cols: 3, rows: 3 } as const;
  * and the state lasts a few hundred milliseconds.
  */
 const CELL_FILL: Record<CellState, string> = {
-  healthy: "#4cc94c",
+  healthy: "#29bd50",
   // These three are the window's --slow, --warn and --fail verbatim. Two surfaces of one plugin
   // disagreeing about what a state looks like is worse than any choice either could make alone.
   slow: "#f0cc35",

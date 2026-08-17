@@ -8941,16 +8941,11 @@ function renderHistoryHtml(snapshot, token, options) {
     --shadow-lift: 0 6px 18px rgba(0,0,0,.45);
     --accent: #6d9eeb;
 
-    /*
-     * Chart marks. Response time is one series and takes the picker's own accent; slow and
-     * failed are status colours, which mean a state and are never used for a series. Same three
-     * hues validated earlier for colour-blind separation — this blue is a lighter step of it,
-     * so it clears the darker card surface by more, not less.
-     */
-    --ok: var(--accent);
+    /* Chart marks. Healthy is the same green as the key and the state pill. */
+    --ok: var(--good);
     --slow: #fab219;
     --fail: #d03b3b;
-    --good: #4cc94c;
+    --good: #29bd50;
     --serious: #ec835a;
   }
 
@@ -10430,7 +10425,7 @@ const EMPTY_GRID = { cols: 3, rows: 3 };
  * and the state lasts a few hundred milliseconds.
  */
 const CELL_FILL = {
-    healthy: "#4cc94c",
+    healthy: "#29bd50",
     // These three are the window's --slow, --warn and --fail verbatim. Two surfaces of one plugin
     // disagreeing about what a state looks like is worse than any choice either could make alone.
     slow: "#f0cc35",
@@ -10803,8 +10798,8 @@ function renderBoardHtml(overview, token, options = {}) {
     --shadow-lift: 0 6px 18px rgba(0,0,0,.45);
     --accent: #6d9eeb;
 
-    --ok: var(--accent);
-    --good: #4cc94c;
+    --ok: var(--good);
+    --good: #29bd50;
     /* The healthy card's edge: --good at about 45% over the window, so it reads as green without
        eight of them competing with the two that are red. */
     --good-line: #3e763e;

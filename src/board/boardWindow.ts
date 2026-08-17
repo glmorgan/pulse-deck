@@ -177,8 +177,8 @@ export function renderBoardHtml(
     --shadow-lift: 0 6px 18px rgba(0,0,0,.45);
     --accent: #6d9eeb;
 
-    --ok: var(--accent);
-    --good: #4cc94c;
+    --ok: var(--good);
+    --good: #29bd50;
     /* The healthy card's edge: --good at about 45% over the window, so it reads as green without
        eight of them competing with the two that are red. */
     --good-line: #3e763e;
