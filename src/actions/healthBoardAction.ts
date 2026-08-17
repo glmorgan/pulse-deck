@@ -219,9 +219,14 @@ export class HealthBoardAction extends SingletonAction<BoardSettings> {
               if (instance.settings.services.length >= BOARD_CAPACITY) {
                 throw new Error(`A board holds ${BOARD_CAPACITY} services.`);
               }
+              const url = String(draft.url ?? "");
               const service: ServiceConfig = {
-                ...newService(String(draft.name ?? ""), String(draft.url ?? "")),
+                ...newService("", url),
                 ...draft,
+                // The form's placeholder promises the host as a default, and nothing was keeping
+                // that promise once the inspector's own add path went away: a service saved with
+                // no name arrived as "Unnamed service" on the card and in the list.
+                name: String(draft.name ?? "").trim() || hostOf(url),
                 id: newServiceId(),
               };
               instance.settings.services.push(service);
@@ -237,7 +242,14 @@ export class HealthBoardAction extends SingletonAction<BoardSettings> {
               const index = instance.settings.services.findIndex((s) => s.id === serviceId);
               if (index < 0) throw new Error("That service is no longer on this board.");
               const existing = instance.settings.services[index];
-              instance.settings.services[index] = { ...existing, ...draft, id: existing.id };
+              instance.settings.services[index] = {
+                ...existing,
+                ...draft,
+                // Clearing the name falls back to the host, as it does when adding, rather than
+                // leaving a service with no name at all.
+                name: String(draft.name ?? "").trim() || hostOf(String(draft.url ?? existing.url)),
+                id: existing.id,
+              };
               await this.afterMutation(keyAction, instance);
               void this.checkService(keyAction, instance, serviceId)
                 .then(() => this.persist(keyAction, instance));
@@ -331,44 +343,17 @@ export class HealthBoardAction extends SingletonAction<BoardSettings> {
   // ── Inspector messages ───────────────────────────────────────────────────
 
   /**
-   * Temporary bridge for adding and removing services until the manager window exists.
+   * The inspector holds one button, and this is what it does.
    *
-   * The inspector will end up holding a single button, so nothing here is meant to last; it is
-   * what makes the board testable end to end in the meantime.
+   * It briefly held fields for adding a service, from before the window could. Two places to add
+   * one service is one too many — they would have disagreed the first time either changed — so
+   * those went with the window's own Add service.
    */
   async onSendToPlugin(ev: SendToPluginEvent<JsonValue, BoardSettings>): Promise<void> {
     if (!ev.action.isKey()) return;
-    const keyAction = ev.action;
-    const instance = this.instances.get(keyAction.id);
-    if (!instance) return;
-
-    const payload = ev.payload as { event?: string; name?: string; url?: string; id?: string };
-
-    if (payload.event === "addService" && typeof payload.url === "string") {
-      if (instance.settings.services.length >= BOARD_CAPACITY) {
-        streamDeck.logger.warn(`board is full; ${BOARD_CAPACITY} services is the cap`);
-        return;
-      }
-      const service = newService(payload.name?.trim() || hostOf(payload.url), payload.url.trim());
-      instance.settings.services.push(service);
-      instance.settings.runtime[service.id] = { ...EMPTY_RUNTIME };
-      await this.persist(keyAction, instance);
-      await this.drawKey(keyAction, instance);
-      this.resetTimer(keyAction.id, keyAction);
-      await this.checkService(keyAction, instance, service.id);
-      return;
-    }
-
-    if (payload.event === "removeLast") {
-      const gone = instance.settings.services.pop();
-      if (gone) delete instance.settings.runtime[gone.id];
-      await this.persist(keyAction, instance);
-      await this.drawKey(keyAction, instance);
-      return;
-    }
-
-    if (payload.event === "checkAll") {
-      await this.runRound(keyAction.id, keyAction);
+    const payload = ev.payload as { event?: string };
+    if (payload.event === "openManager") {
+      void this.openManager(ev.action.id, ev.action);
     }
   }
 

@@ -8,56 +8,32 @@
 
 <body>
   <!--
-    Temporary scaffolding. Health Board's configuration belongs in the manager window; this
-    inspector will end up holding a single "Open manager" button. Until that window exists, these
-    fields are the only way to put services on a board, which is what makes the key testable.
+    One button, by design.
+
+    A board's configuration lives in the manager window: services, their overrides, the order they
+    sit in on the key, and the defaults they inherit. This inspector held fields for adding a
+    service while the window was being built; keeping them now would mean two places to add one,
+    which would disagree the first time either changed.
+
+    Stream Deck always shows something when a key is selected, so an empty inspector reads as
+    broken — hence a button and a sentence rather than nothing at all.
   -->
-  <sdpi-item label="Name">
-    <sdpi-textfield id="name" placeholder="Optional — defaults to the host"></sdpi-textfield>
-  </sdpi-item>
-
-  <sdpi-item label="URL">
-    <sdpi-textfield id="url" placeholder="https://api.example.com/health"></sdpi-textfield>
-  </sdpi-item>
-
-  <sdpi-item label="Add">
-    <sdpi-button id="add">Add service</sdpi-button>
-  </sdpi-item>
-
-  <sdpi-item label="Check">
-    <sdpi-button id="checkAll">Check all now</sdpi-button>
-  </sdpi-item>
-
-  <sdpi-item label="Remove">
-    <sdpi-button id="removeLast">Remove last service</sdpi-button>
+  <sdpi-item label="Board">
+    <sdpi-button id="manage">Open manager</sdpi-button>
   </sdpi-item>
 
   <sdpi-item label="">
     <sdpi-item-value>
-      Up to twelve services. The key draws one cell per service in the order they were added,
-      in a grid sized to fit them: green healthy, amber slow, red failing, grey not yet checked.
+      Services, thresholds and ordering are all managed in the window. You can also open it with a
+      short press on the key; hold the key to check every service now.
     </sdpi-item-value>
   </sdpi-item>
 
   <script>
     document.addEventListener('DOMContentLoaded', () => {
-      const send = (event, extra) =>
-        SDPIComponents.streamDeckClient.send('sendToPlugin', { event, ...extra });
-
-      document.getElementById('add').addEventListener('click', () => {
-        const url = document.getElementById('url');
-        const name = document.getElementById('name');
-        if (!url.value) return;
-        send('addService', { url: url.value, name: name.value });
-        // Cleared so the next one can be typed straight in; the plugin owns the list from here.
-        url.value = '';
-        name.value = '';
+      document.getElementById('manage').addEventListener('click', () => {
+        SDPIComponents.streamDeckClient.send('sendToPlugin', { event: 'openManager' });
       });
-
-      document.getElementById('checkAll')
-        .addEventListener('click', () => send('checkAll'));
-      document.getElementById('removeLast')
-        .addEventListener('click', () => send('removeLast'));
     });
   </script>
 </body>
