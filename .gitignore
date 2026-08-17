@@ -33,3 +33,6 @@ build/
 .env
 .env.local
 .env.*.local
+
+# Packed plugin archive — a release asset, rebuilt by npm run pack
+*.streamDeckPlugin
