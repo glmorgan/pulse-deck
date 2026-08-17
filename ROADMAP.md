@@ -51,6 +51,29 @@ The cost that is easy to miss: `bin/pulse-host` is a window and nothing else. Ch
 save and open panels, which means adding those modes to the host — quick-clips' `picker-host` has
 them, along with the notes on why they need a different activation policy from the window itself.
 
+## Check faster while something is failing
+
+A board on an hourly interval can miss a short outage entirely, and will not notice a recovery for
+up to an hour. The established shape is two intervals rather than one — Nagios and Icinga call them
+`check_interval` and `retry_interval` — where a failing service moves to the shorter one until it
+is believed again, which pairs naturally with the recovery threshold already in place.
+
+Three things it has to get right:
+
+- **Bounded, and fused.** Polling harder at a service that is already struggling is how a client
+  makes an outage worse; the convention everywhere else is to back off. So a floor on the retry
+  interval, and a limit on how long acceleration lasts before it returns to the normal cadence.
+- **Never accelerate on a 429, or a 503 with `Retry-After`.** That is the service asking for less
+  traffic, and speeding up is the one response guaranteed to be wrong. Honouring `Retry-After` as
+  the next check time would be better than ignoring it, which is what happens today.
+- **It spends the history window.** Sixty records at fifteen seconds covers a quarter of an hour,
+  so the faster it polls the less of the run-up to the outage survives — exactly when that context
+  is worth the most. Either the window grows while retrying, or retry records are thinned when the
+  service recovers.
+
+Worth being an option rather than a default, and worth being settable per service: a payment API
+and an internal dashboard do not deserve the same urgency.
+
 ## Signing and notarization
 
 `bin/pulse-host` is ad-hoc signed, so on any machine other than the one it was built on Gatekeeper
