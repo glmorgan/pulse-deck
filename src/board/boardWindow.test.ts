@@ -34,6 +34,7 @@ function boardOf(count: number, withHistory = true): BoardSettings {
         history: [record(), record({ ok: i === 2, responseTimeMs: 900 })],
         currentState: i === 0 ? "healthy" : i === 1 ? "slow" : "down",
         consecutiveFailures: i === 2 ? 3 : 0,
+        consecutiveSuccesses: i === 2 ? 0 : 2,
         lastCheckedAt: record().timestamp,
         lastStatusCode: 200,
         lastResponseTimeMs: 120,

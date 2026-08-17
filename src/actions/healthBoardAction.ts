@@ -416,6 +416,7 @@ export class HealthBoardAction extends SingletonAction<BoardSettings> {
     }
 
     instance.inFlight.add(serviceId);
+    const previousState = runtime.currentState;
     runtime.currentState = "checking";
     instance.settings.runtime[serviceId] = runtime;
     await this.drawKey(keyAction, instance);
@@ -423,15 +424,24 @@ export class HealthBoardAction extends SingletonAction<BoardSettings> {
     try {
       const result = await runHealthCheck(resolved);
       const failures = result.ok ? 0 : runtime.consecutiveFailures + 1;
+      const successes = result.ok ? runtime.consecutiveSuccesses + 1 : 0;
+      // `runtime.currentState` was set to "checking" above, so the state to judge against is the
+      // one captured before that, not what is on the runtime now.
       const record = buildCheckRecord(
         result,
-        evaluateButtonState(resolved, failures, buildCheckRecord(result, "unknown"))
+        evaluateButtonState(resolved, {
+          consecutiveFailures: failures,
+          consecutiveSuccesses: successes,
+          previousState,
+          lastRecord: buildCheckRecord(result, "unknown"),
+        })
       );
 
       instance.settings.runtime[serviceId] = {
         history: appendRecord(runtime.history, record),
         currentState: record.state,
         consecutiveFailures: failures,
+        consecutiveSuccesses: successes,
         lastCheckedAt: record.timestamp,
         lastStatusCode: result.statusCode,
         lastResponseTimeMs: result.responseTimeMs,

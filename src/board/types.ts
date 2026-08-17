@@ -28,6 +28,7 @@ export interface ServiceConfig {
   slowThresholdMs: number | null;
   amberAfterFailures: number | null;
   redAfterFailures: number | null;
+  recoverAfterSuccesses: number | null;
   expectedBodyContains: string | null;
   showBodySnippetInHistory: boolean | null;
 }
@@ -38,6 +39,8 @@ export interface ServiceRuntime {
   history: CheckRecord[];
   currentState: ButtonState;
   consecutiveFailures: number;
+  /** Reset by any failure. Counts toward the service's recovery threshold. */
+  consecutiveSuccesses: number;
   lastCheckedAt: string | null;
   lastStatusCode: number | null;
   lastResponseTimeMs: number | null;
@@ -52,6 +55,8 @@ export interface BoardDefaults {
   slowThresholdMs: number;
   amberAfterFailures: number;
   redAfterFailures: number;
+  /** Consecutive successes before a failing service is believed again. 1 is no damping. */
+  recoverAfterSuccesses: number;
   expectedBodyContains: string;
   showBodySnippetInHistory: boolean;
 }
@@ -73,6 +78,8 @@ export const DEFAULT_BOARD_DEFAULTS: BoardDefaults = {
   slowThresholdMs: 1000,
   amberAfterFailures: 1,
   redAfterFailures: 3,
+  // 1 is what the board did before this existed, so a saved board is unaffected.
+  recoverAfterSuccesses: 1,
   expectedBodyContains: "",
   showBodySnippetInHistory: false,
 };
@@ -88,6 +95,7 @@ export const EMPTY_RUNTIME: ServiceRuntime = {
   history: [],
   currentState: "unknown",
   consecutiveFailures: 0,
+  consecutiveSuccesses: 0,
   lastCheckedAt: null,
   lastStatusCode: null,
   lastResponseTimeMs: null,

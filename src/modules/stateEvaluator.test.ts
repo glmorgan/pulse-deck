@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { evaluateButtonState, validateSettings, buildCheckRecord } from "./stateEvaluator.js";
+import type { StateInputs } from "./stateEvaluator.js";
 import { DEFAULT_SETTINGS } from "../types.js";
 import type { CheckRecord, HealthCheckSettings } from "../types.js";
 
@@ -29,44 +30,103 @@ const failRecord = (): CheckRecord => ({
 
 // ── evaluateButtonState ────────────────────────────────────────────────────
 
+/** Defaults for everything the case under test is not about. */
+const at = (
+  s: HealthCheckSettings,
+  inputs: Partial<StateInputs>
+): string => evaluateButtonState(s, {
+  consecutiveFailures: 0,
+  consecutiveSuccesses: 0,
+  previousState: "healthy",
+  lastRecord: null,
+  ...inputs,
+});
+
 describe("evaluateButtonState", () => {
   it("returns unknown when no record exists", () => {
-    expect(evaluateButtonState(settings(), 0, null)).toBe("unknown");
+    expect(at(settings(), { lastRecord: null })).toBe("unknown");
   });
 
   it("returns healthy when check passed and response is fast", () => {
-    expect(evaluateButtonState(settings(), 0, okRecord(500))).toBe("healthy");
+    expect(at(settings(), { lastRecord: okRecord(500) })).toBe("healthy");
   });
 
   it("returns slow when check passed but response exceeded slow threshold", () => {
-    expect(evaluateButtonState(settings(), 0, okRecord(1500))).toBe("slow");
+    expect(at(settings(), { lastRecord: okRecord(1500) })).toBe("slow");
   });
 
   it("returns warning when failures are below red threshold", () => {
     const s = settings();
-    expect(evaluateButtonState(s, 1, failRecord())).toBe("warning");
-    expect(evaluateButtonState(s, 2, failRecord())).toBe("warning");
+    expect(at(s, { consecutiveFailures: 1, lastRecord: failRecord() })).toBe("warning");
+    expect(at(s, { consecutiveFailures: 2, lastRecord: failRecord() })).toBe("warning");
   });
 
-  it("returns down when failures reach red threshold", () => {
-    expect(evaluateButtonState(settings(), 3, failRecord())).toBe("down");
+  it("returns down when failures reach or exceed the red threshold", () => {
+    expect(at(settings(), { consecutiveFailures: 3, lastRecord: failRecord() })).toBe("down");
+    expect(at(settings(), { consecutiveFailures: 10, lastRecord: failRecord() })).toBe("down");
   });
 
-  it("returns down when failures exceed red threshold", () => {
-    expect(evaluateButtonState(settings(), 10, failRecord())).toBe("down");
-  });
-
-  it("respects custom amber and red thresholds", () => {
+  it("holds the previous state until failures reach the amber threshold", () => {
+    // This is the setting that was configured, inherited and validated but never read: before
+    // this, one failure was warning however high amberAfterFailures was set.
     const s = { ...settings(), amberAfterFailures: 2, redAfterFailures: 5 };
-    expect(evaluateButtonState(s, 1, failRecord())).toBe("warning");
-    expect(evaluateButtonState(s, 4, failRecord())).toBe("warning");
-    expect(evaluateButtonState(s, 5, failRecord())).toBe("down");
+    expect(at(s, { consecutiveFailures: 1, lastRecord: failRecord() })).toBe("healthy");
+    expect(at(s, { consecutiveFailures: 2, lastRecord: failRecord() })).toBe("warning");
+    expect(at(s, { consecutiveFailures: 4, lastRecord: failRecord() })).toBe("warning");
+    expect(at(s, { consecutiveFailures: 5, lastRecord: failRecord() })).toBe("down");
+  });
+
+  it("does not let a sub-amber failure promote a failing service", () => {
+    // Holding the previous state, rather than returning healthy, is what makes this work: a
+    // service that was down, passed once and failed again must not come back as healthy.
+    const s = { ...settings(), amberAfterFailures: 3, redAfterFailures: 5 };
+    expect(at(s, { consecutiveFailures: 1, previousState: "down", lastRecord: failRecord() }))
+      .toBe("down");
+  });
+
+  it("calls a first-ever failure warning, having no previous state to hold", () => {
+    const s = { ...settings(), amberAfterFailures: 3 };
+    expect(at(s, { consecutiveFailures: 1, previousState: "unknown", lastRecord: failRecord() }))
+      .toBe("warning");
   });
 
   it("respects custom slow threshold", () => {
     const s = { ...settings(), slowThresholdMs: 500 };
-    expect(evaluateButtonState(s, 0, okRecord(499))).toBe("healthy");
-    expect(evaluateButtonState(s, 0, okRecord(501))).toBe("slow");
+    expect(at(s, { lastRecord: okRecord(499) })).toBe("healthy");
+    expect(at(s, { lastRecord: okRecord(501) })).toBe("slow");
+  });
+
+  it("clears a failure on the first success by default", () => {
+    // recoverAfterSuccesses is 1 out of the box, which is exactly the behaviour that shipped
+    // before the setting existed.
+    expect(at(settings(), {
+      consecutiveSuccesses: 1, previousState: "down", lastRecord: okRecord(100),
+    })).toBe("healthy");
+  });
+
+  it("holds a failing state until the recovery threshold is met", () => {
+    const s = { ...settings(), recoverAfterSuccesses: 3 };
+    for (const previousState of ["down", "warning"] as const) {
+      expect(at(s, { consecutiveSuccesses: 1, previousState, lastRecord: okRecord() }))
+        .toBe(previousState);
+      expect(at(s, { consecutiveSuccesses: 2, previousState, lastRecord: okRecord() }))
+        .toBe(previousState);
+      expect(at(s, { consecutiveSuccesses: 3, previousState, lastRecord: okRecord() }))
+        .toBe("healthy");
+    }
+  });
+
+  it("recovers into slow when the recovering check is slow", () => {
+    const s = { ...settings(), recoverAfterSuccesses: 2 };
+    expect(at(s, {
+      consecutiveSuccesses: 2, previousState: "down", lastRecord: okRecord(1500),
+    })).toBe("slow");
+  });
+
+  it("does not gate recovery from slow, which is a level rather than a fault", () => {
+    const s = { ...settings(), recoverAfterSuccesses: 5 };
+    expect(at(s, { consecutiveSuccesses: 1, previousState: "slow", lastRecord: okRecord(100) }))
+      .toBe("healthy");
   });
 });
 

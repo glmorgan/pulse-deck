@@ -8306,11 +8306,15 @@ const DEFAULT_SETTINGS = {
     slowThresholdMs: 1000,
     amberAfterFailures: 1,
     redAfterFailures: 3,
+    // 1 is the behaviour that shipped before this setting existed, so an existing button whose
+    // settings predate it is unaffected by the coercion in mergeWithDefaults.
+    recoverAfterSuccesses: 1,
     expectedBodyContains: "",
     showBodySnippetInHistory: false,
     history: [],
     currentState: "unknown",
     consecutiveFailures: 0,
+    consecutiveSuccesses: 0,
     lastCheckedAt: null,
     lastStatusCode: null,
     lastResponseTimeMs: null,
@@ -9972,13 +9976,47 @@ async function showHistoryWindow(hostPath, options) {
     });
 }
 
-function evaluateButtonState(settings, consecutiveFailures, lastRecord) {
+/** States that describe a settled reading, as against "not checked" and "being checked". */
+const SETTLED = ["healthy", "slow", "warning", "down"];
+const FAILING = ["warning", "down"];
+/**
+ * The state a service should be in, given what just happened and where it has been.
+ *
+ * Both directions are damped, and neither used to be quite right:
+ *
+ * - **Into trouble.** `amberAfterFailures` was configured, inherited and validated, and never
+ *   read: any failure returned `warning` and only `down` had a threshold. Below the amber count a
+ *   failure now holds the previous state rather than raising one, which is what the setting always
+ *   claimed. Holding rather than returning "healthy" matters on the way back down too, or a
+ *   service that was down, passed once and failed again would be promoted to healthy by failing.
+ *
+ * - **Out of it.** One success used to clear an outage outright, so a service alternating pass and
+ *   fail alternated green and red on every round. `recoverAfterSuccesses` is the count of
+ *   consecutive successes needed before a failing service is believed again. It defaults to 1,
+ *   which is exactly the old behaviour.
+ *
+ * Recovery gates `warning` and `down` only. `slow` is a level read off the latest latency rather
+ * than a fault, and one counter cannot serve both: a slow check is a success, so counting it as
+ * recovery would let a still-slow service call itself healthy, and not counting it would strand a
+ * service that recovered from an outage into merely being slow.
+ */
+function evaluateButtonState(settings, inputs) {
+    const { consecutiveFailures, consecutiveSuccesses, previousState, lastRecord } = inputs;
     if (!lastRecord)
         return "unknown";
     if (!lastRecord.ok) {
         if (consecutiveFailures >= settings.redAfterFailures)
             return "down";
-        return "warning";
+        if (consecutiveFailures >= settings.amberAfterFailures)
+            return "warning";
+        // Not enough failures to call it. Nothing changes, in either direction. A first-ever check
+        // that fails has no previous state to hold, and "unknown" would read as never checked.
+        return SETTLED.includes(previousState) ? previousState : "warning";
+    }
+    // A success does not clear a failure on its own. The latency of this check is still recorded;
+    // it simply does not get to decide the state yet.
+    if (FAILING.includes(previousState) && consecutiveSuccesses < settings.recoverAfterSuccesses) {
+        return previousState;
     }
     if (lastRecord.responseTimeMs > settings.slowThresholdMs)
         return "slow";
@@ -10011,6 +10049,9 @@ function validateSettings(settings) {
     }
     if (settings.redAfterFailures < settings.amberAfterFailures) {
         return "Red threshold must be >= amber threshold";
+    }
+    if (settings.recoverAfterSuccesses < 1) {
+        return "Recovery threshold must be at least 1";
     }
     return null;
 }
@@ -10208,22 +10249,33 @@ let HealthCheckAction = (() => {
             finally {
                 instance.isChecking = false;
             }
+            // Captured before the counters move, because the recovery threshold is judged against where
+            // the service was, not where this check is about to put it.
+            const previousState = instance.settings.currentState;
             if (result.ok) {
                 instance.settings.consecutiveFailures = 0;
+                instance.settings.consecutiveSuccesses = (instance.settings.consecutiveSuccesses ?? 0) + 1;
             }
             else {
                 instance.settings.consecutiveFailures += 1;
+                instance.settings.consecutiveSuccesses = 0;
             }
             const tempRecord = {
                 timestamp: new Date().toISOString(),
                 ok: result.ok,
+                state: "unknown",
                 statusCode: result.statusCode,
                 responseTimeMs: result.responseTimeMs,
                 bodyMatched: result.bodyMatched,
                 bodySnippet: result.bodySnippet,
                 error: result.error,
             };
-            const newState = evaluateButtonState(instance.settings, instance.settings.consecutiveFailures, tempRecord);
+            const newState = evaluateButtonState(instance.settings, {
+                consecutiveFailures: instance.settings.consecutiveFailures,
+                consecutiveSuccesses: instance.settings.consecutiveSuccesses,
+                previousState,
+                lastRecord: tempRecord,
+            });
             const record = buildCheckRecord(result, newState);
             instance.settings.history = appendRecord(instance.settings.history, record);
             instance.settings.currentState = newState;
@@ -10261,6 +10313,7 @@ function mergeWithDefaults(saved) {
         slowThresholdMs: Number(base.slowThresholdMs) || DEFAULT_SETTINGS.slowThresholdMs,
         amberAfterFailures: Number(base.amberAfterFailures) || DEFAULT_SETTINGS.amberAfterFailures,
         redAfterFailures: Number(base.redAfterFailures) || DEFAULT_SETTINGS.redAfterFailures,
+        recoverAfterSuccesses: Number(base.recoverAfterSuccesses) || DEFAULT_SETTINGS.recoverAfterSuccesses,
     };
 }
 // ── Module-level rendering helpers ─────────────────────────────────────────
@@ -10301,20 +10354,31 @@ const SIZE = 144;
 /** A board with nothing on it: there is no count to fit a grid to, so it keeps the old 3×3. */
 const EMPTY_GRID = { cols: 3, rows: 3 };
 /**
- * Four colours, no more: green, amber, red, grey.
+ * One colour per state the key can usefully tell apart: green, yellow, orange, red, grey.
  *
- * The window distinguishes five states, but a small cell cannot. Warning and down were adjacent
- * hues at similar lightness — orange against amber — and telling them apart at this size was
- * guesswork, worse for anyone red/green colourblind. So a failing check is red whether or not it
- * has passed the red threshold, and how long it has been failing is a question for the window.
+ * Warning used to share red with down, and the reason was measured rather than assumed: with slow
+ * at #fab219 and warning at an orange of the same lightness, the two sat 15 degrees of hue apart
+ * with nothing else separating them, and at cell size that was guesswork. Dropping warning into
+ * red was the cheap fix.
+ *
+ * The window's palette then moved both of them: slow toward a true yellow and up in lightness,
+ * warning toward red and down in lightness, about 25 degrees and 11 points apart. That is the pair
+ * that failed before, separated on two axes instead of one, so the key can carry it now and the
+ * two surfaces of the plugin agree about what a warning looks like.
+ *
+ * Warning and down are still the pair to watch here: they differ by hue and by lightness, but a
+ * cell is 20×14 device pixels on the hardware and the window is where a failing service says how
+ * long it has been failing.
  *
  * `checking` sits with the greys rather than getting a colour of its own: a key image is a still,
  * and the state lasts a few hundred milliseconds.
  */
 const CELL_FILL = {
     healthy: "#4cc94c",
-    slow: "#fab219",
-    warning: "#d03b3b",
+    // These three are the window's --slow, --warn and --fail verbatim. Two surfaces of one plugin
+    // disagreeing about what a state looks like is worse than any choice either could make alone.
+    slow: "#f0cc35",
+    warning: "#d1621b",
     down: "#d03b3b",
     checking: "#5a5a5a",
     unknown: "#4a4a4a",
@@ -10394,6 +10458,8 @@ const DEFAULT_BOARD_DEFAULTS = {
     slowThresholdMs: 1000,
     amberAfterFailures: 1,
     redAfterFailures: 3,
+    // 1 is what the board did before this existed, so a saved board is unaffected.
+    recoverAfterSuccesses: 1,
     expectedBodyContains: "",
     showBodySnippetInHistory: false,
 };
@@ -10407,6 +10473,7 @@ const EMPTY_RUNTIME = {
     history: [],
     currentState: "unknown",
     consecutiveFailures: 0,
+    consecutiveSuccesses: 0,
     lastCheckedAt: null,
     lastStatusCode: null,
     lastResponseTimeMs: null,
@@ -10431,6 +10498,7 @@ function newService(name, url) {
         slowThresholdMs: null,
         amberAfterFailures: null,
         redAfterFailures: null,
+        recoverAfterSuccesses: null,
         expectedBodyContains: null,
         showBodySnippetInHistory: null,
     };
@@ -10457,11 +10525,13 @@ function resolveService(defaults, service, runtime = EMPTY_RUNTIME) {
         slowThresholdMs: num(inherit(service.slowThresholdMs, defaults.slowThresholdMs), DEFAULT_BOARD_DEFAULTS.slowThresholdMs),
         amberAfterFailures: num(inherit(service.amberAfterFailures, defaults.amberAfterFailures), DEFAULT_BOARD_DEFAULTS.amberAfterFailures),
         redAfterFailures: num(inherit(service.redAfterFailures, defaults.redAfterFailures), DEFAULT_BOARD_DEFAULTS.redAfterFailures),
+        recoverAfterSuccesses: num(inherit(service.recoverAfterSuccesses, defaults.recoverAfterSuccesses), DEFAULT_BOARD_DEFAULTS.recoverAfterSuccesses),
         expectedBodyContains: inherit(service.expectedBodyContains, defaults.expectedBodyContains),
         showBodySnippetInHistory: inherit(service.showBodySnippetInHistory, defaults.showBodySnippetInHistory),
         history: runtime.history ?? [],
         currentState: runtime.currentState ?? "unknown",
         consecutiveFailures: runtime.consecutiveFailures ?? 0,
+        consecutiveSuccesses: runtime.consecutiveSuccesses ?? 0,
         lastCheckedAt: runtime.lastCheckedAt ?? null,
         lastStatusCode: runtime.lastStatusCode ?? null,
         lastResponseTimeMs: runtime.lastResponseTimeMs ?? null,
@@ -10528,6 +10598,8 @@ function buildBoardOverview(settings, undo = null) {
             lastCheckedAt: runtime.lastCheckedAt,
             uptimePct: stats.uptimePct,
             checks: stats.total,
+            medianMs: stats.median,
+            slowChecks: stats.overThreshold,
             consecutiveFailures: runtime.consecutiveFailures,
             lastError: lastErrorOf(runtime.history ?? [], service),
             spark: (runtime.history ?? []).slice(-24).map((record) => ({
@@ -10546,8 +10618,17 @@ function buildBoardOverview(settings, undo = null) {
         configs: settings.services,
         total: services.length,
         // Slow is not failing — it answered. Kept apart so the header can say both.
-        failing: services.filter((s) => s.state === "down" || s.state === "warning" || s.state === "config-error").length,
+        //
+        // Nor is a configuration error, which used to be counted here: nothing is wrong with the
+        // endpoint, we never asked it anything. Counting it as failing put a setup mistake and a real
+        // outage in the same number on a board whose whole job is telling you which you have.
+        failing: services.filter((s) => s.state === "down" || s.state === "warning").length,
+        misconfigured: services.filter((s) => s.state === "config-error").length,
         slow: services.filter((s) => s.state === "slow").length,
+        // Counted rather than left to the header to infer. `total - failing` counted a slow service
+        // as healthy as well as slow, so the three numbers summed to more than the board held. The
+        // remainder here is the never-checked and the mid-check, which the header simply omits.
+        healthy: services.filter((s) => s.state === "healthy").length,
         generatedAt: Date.now(),
     };
 }
@@ -10668,7 +10749,24 @@ function renderBoardHtml(overview, token, options = {}) {
 
     --ok: var(--accent);
     --good: #4cc94c;
-    --slow: #fab219;
+    /* The healthy card's edge: --good at about 45% over the window, so it reads as green without
+       eight of them competing with the two that are red. */
+    --good-line: #3e763e;
+    /*
+     * Slow, warning and down are three points on one continuum, so they are separated on two
+     * axes rather than one.
+     *
+     * The first attempt put warning at #e07a2c, which read as a shade of the amber next to it:
+     * 15 degrees of hue apart and, measured, the same lightness to within a point and a half.
+     * Hue alone cannot carry yellow, orange and red — pushing them apart on the wheel only walks
+     * each one into its neighbour.
+     *
+     * So slow moved toward a true yellow and up in lightness, warning moved toward red and down
+     * in lightness. That is about 25 degrees of hue and 11 points of lightness between them, and
+     * warning now sits darker than both of its neighbours, which is a cue of its own.
+     */
+    --slow: #f0cc35;
+    --warn: #d1621b;
     --fail: #d03b3b;
   }
 
@@ -10721,7 +10819,8 @@ function renderBoardHtml(overview, token, options = {}) {
   }
   .dot[data-state="healthy"] { background: var(--good); }
   .dot[data-state="slow"] { background: var(--slow); }
-  .dot[data-state="warning"], .dot[data-state="down"], .dot[data-state="config-error"] { background: var(--fail); }
+  .dot[data-state="warning"] { background: var(--warn); }
+  .dot[data-state="down"] { background: var(--fail); }
   .rail-foot { display: flex; flex-direction: column; gap: 2px; }
   .row.muted { color: var(--fg-dim); }
 
@@ -10772,6 +10871,17 @@ function renderBoardHtml(overview, token, options = {}) {
     background: var(--card); border: 2px solid var(--card-line); border-radius: 11px;
     box-shadow: var(--shadow); padding: 11px 13px 10px;
     display: flex; flex-direction: column; gap: 3px; min-width: 0;
+    /*
+     * A floor, not a fixed height, and the whole of it is spent on the gap above the footing,
+     * because margin-top:auto is what absorbs the slack.
+     *
+     * The card's own content comes to about 134. At 148 the four rows plus their gaps overran the
+     * pane by a few pixels and the grid took a scrollbar, which cost more height again. 140 keeps
+     * a little air above the rule and leaves four rows about twenty pixels clear. Set here rather
+     * than as grid-auto-rows so a board of five gets the same card as a board of twelve instead
+     * of three enormous ones.
+     */
+    min-height: 140px;
   }
   .cardbtn:hover { background: var(--hover); }
   .cardbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -10783,22 +10893,64 @@ function renderBoardHtml(overview, token, options = {}) {
     font-size: 20px; font-weight: 600; letter-spacing: -.02em; margin-top: 1px;
   }
   .cardbtn .figure .unit { font-size: 11px; font-weight: 500; color: var(--fg-dim); margin-left: 3px; }
-  .cardbtn .meta { font-size: 11px; color: var(--fg-faint); }
   /*
-   * Emphasis, not decoration: a healthy card is left alone.
+   * The footing sits at the bottom of the card, not under the figure.
    *
-   * Colouring every card would make a wall of green that says nothing, and the eye would have to
-   * find the one that differs by hue alone. Only the exceptions are marked — a red edge and a
-   * tinted face for something failing, amber for something slow — so trouble is the thing that
-   * looks different rather than one of twelve things that look busy.
+   * margin-top:auto is what spends the height rather than padding it: the state and the figure
+   * stay at the top where they are read first, the three figures line up across the whole grid,
+   * and the space between them is the card breathing instead of a gap left over.
    */
-  .cardbtn[data-state="slow"] { border-color: var(--slow); }
-  .cardbtn[data-state="down"], .cardbtn[data-state="warning"],
-  .cardbtn[data-state="config-error"] {
-    border-color: var(--fail); background: #2f2323;
+  .cardbtn .stats {
+    margin-top: auto; padding-top: 9px; border-top: 1px solid rgba(255,255,255,.07);
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
   }
-  .cardbtn[data-state="down"]:hover, .cardbtn[data-state="warning"]:hover,
-  .cardbtn[data-state="config-error"]:hover { background: #352626; }
+  .cardbtn .stat { min-width: 0; }
+  .cardbtn .stat .k {
+    font-size: 9.5px; letter-spacing: .07em; text-transform: uppercase; color: var(--fg-faint);
+  }
+  .cardbtn .stat .v {
+    font-size: 13px; font-weight: 600; color: var(--fg-dim); font-variant-numeric: tabular-nums;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .cardbtn .stat .v .u { font-size: 10px; font-weight: 500; color: var(--fg-faint); margin-left: 2px; }
+  /*
+   * Every state carries its colour, but not at the same volume.
+   *
+   * Healthy was deliberately left grey while the cards still had sparklines: colouring all of
+   * them made a wall of green, and the eye had to find the one that differed by hue alone. Taking
+   * the sparklines out took most of the colour with them, and a view where nothing is coloured
+   * asks you to read every card to learn that everything is fine.
+   *
+   * So healthy gets a green edge at about half the strength of the others, and only the
+   * exceptions tint their face. Trouble still wins on brightness and on fill, which is two
+   * channels against one.
+   */
+  .cardbtn[data-state="healthy"] { border-color: var(--good-line); }
+  .cardbtn[data-state="slow"] { border-color: var(--slow); }
+  /*
+   * Warning is its own colour here, and shares red with down on the key face.
+   *
+   * That is not an inconsistency to tidy up later. The key collapses them because a cell is about
+   * 14px and a fifth hue between amber and red is guesswork at that size, worse for anyone
+   * red/green colourblind. A card is 240px wide with the word "Warning" written on it, so the
+   * colour is confirming a label rather than carrying the whole message alone.
+   *
+   * Warning keeps the tinted face, because it is a failure: the difference from down is that it
+   * has not yet failed enough times in a row to be believed. So hue separates them and fill still
+   * marks both as trouble, which is what keeps the pair apart from slow.
+   */
+  .cardbtn[data-state="warning"] { border-color: var(--warn); background: #2f2a20; }
+  .cardbtn[data-state="warning"]:hover { background: #363023; }
+  /*
+   * A configuration error keeps the default grey, with never-checked and mid-check.
+   *
+   * It was red, which made it the only state whose colour described the service rather than what
+   * the checker found — nothing is wrong with the endpoint, we never asked it anything. Red also
+   * put it in the same bucket as a real outage on a board where the outage is what you are
+   * looking for. The key face already drew it grey, so this is the window catching up.
+   */
+  .cardbtn[data-state="down"] { border-color: var(--fail); background: #2f2323; }
+  .cardbtn[data-state="down"]:hover { background: #352626; }
   .cardbtn svg { display: block; width: 100%; height: 26px; margin-top: 4px; }
 
   .empty {
@@ -10829,17 +10981,62 @@ function renderBoardHtml(overview, token, options = {}) {
 
   /* ── forms ──────────────────────────────────────────────────────────── */
   .form { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding-right: 4px; }
-  .field { display: flex; align-items: center; gap: 12px; margin-bottom: 9px; }
-  .field label { flex: 0 0 132px; font-size: 12px; color: var(--fg-dim); text-align: right; }
+  /*
+   * Three fixed columns, not a flex row.
+   *
+   * As flex, the hint sat after the input and took whatever width its text needed, so the input
+   * ended wherever that text began: "shown on the card and in the list" made the Name box narrow
+   * and "board: 1" made Amber after wide. Every input in a form was a different length, for a
+   * reason that had nothing to do with what goes in it. A fixed hint column ends that.
+   */
+  .field {
+    display: grid; grid-template-columns: 132px minmax(0, 1fr) 196px;
+    align-items: center; gap: 12px; margin-bottom: 9px;
+  }
+  .field label { font-size: 12px; color: var(--fg-dim); text-align: right; }
   .field input[type="text"], .field select {
-    flex: 1 1 auto; min-width: 0; font: inherit; font-size: 12.5px; color: var(--fg);
+    width: 100%; min-width: 0; font: inherit; font-size: 12.5px; color: var(--fg);
     background: var(--card); border: 1px solid var(--card-line); border-radius: 7px;
     padding: 6px 9px; outline: none;
   }
   .field input:focus, .field select:focus { border-color: var(--accent); }
-  .field .hint { flex: 0 0 auto; font-size: 11px; color: var(--fg-faint); }
-  .field.check { align-items: center; }
+  .field .hint { font-size: 11px; color: var(--fg-faint); }
+  /* The checkbox row keeps the old flex, because its hint is a sentence that belongs beside the
+     box rather than in the narrow column the other hints share. */
+  .field.check { display: flex; align-items: center; gap: 12px; }
+  .field.check label { flex: 0 0 132px; }
   .field.check input { margin: 0; }
+
+  /*
+   * The numbers go in a grid of their own.
+   *
+   * Six of them each took a full row to hold three digits, which made the overrides section as
+   * tall as the rest of the form put together and left a 500px box for the value 200. Three
+   * across turns six rows into two, and a fixed column means all six are the same width as each
+   * other whatever their label or hint says.
+   *
+   * Indented to 144px so the column starts where every other input in the form starts.
+   */
+  /*
+   * The row exists so the grid inside it lands in the input column exactly.
+   *
+   * Indenting by a matching 144px got the left edge right and left the right edge 20px past every
+   * other input, because three fixed columns plus their gaps do not add up to a column sized by
+   * what is left over. Reusing the same three-column track and placing the grid in the second one
+   * makes both edges follow the form instead of being guessed at.
+   */
+  .numrow {
+    display: grid; grid-template-columns: 132px minmax(0, 1fr) 196px;
+    gap: 12px; margin-bottom: 4px;
+  }
+  .numgrid {
+    grid-column: 2;
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px 14px;
+  }
+  .numgrid .field { display: block; margin: 0; }
+  .numgrid .field label { display: block; text-align: left; margin-bottom: 4px; }
+  .numgrid .field input[type="text"] { width: 100%; }
+  .numgrid .field .hint { display: block; margin-top: 4px; }
   details { margin: 14px 0 4px; }
   summary {
     cursor: pointer; font-size: 12px; color: var(--fg-dim); margin-bottom: 10px;
@@ -10847,8 +11044,12 @@ function renderBoardHtml(overview, token, options = {}) {
   }
   summary:hover { color: var(--fg); }
   .form-actions {
-    display: flex; align-items: center; gap: 8px; margin: 16px 0 4px; padding-left: 144px;
+    display: flex; align-items: center; gap: 8px; margin: 16px 0 4px;
+    padding-left: 144px; padding-right: 208px;
   }
+  /* Delete sits away from Cancel. Adjacent, the destructive button is one slip from the one you
+     press to back out, and they are the two you reach for in the same frame of mind. */
+  .form-actions .danger { margin-left: auto; }
   button.ghost {
     font: inherit; font-size: 12px; color: var(--fg-dim);
     background: transparent; border: 1px solid var(--card-line); border-radius: 7px;
@@ -10960,6 +11161,26 @@ function renderBoardHtml(overview, token, options = {}) {
     return value + ' ms';
   }
 
+  /** One figure in a card's footing: the label above it, matching the service view's tiles. */
+  function statCell(label, value, unit) {
+    var cell = el('div', 'stat');
+    cell.appendChild(el('div', 'k', label));
+    var v = el('div', 'v', String(value));
+    if (unit && value !== '—') v.appendChild(el('span', 'u', unit));
+    cell.appendChild(v);
+    return cell;
+  }
+
+  /** The most recent check on the board, which is when the last round landed. */
+  function newestCheck(services) {
+    var newest = null;
+    for (var i = 0; i < services.length; i++) {
+      var at = services[i].lastCheckedAt;
+      if (at && (newest === null || new Date(at).getTime() > new Date(newest).getTime())) newest = at;
+    }
+    return newest;
+  }
+
   function agoOf(iso) {
     if (!iso) return 'never checked';
     var seconds = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
@@ -11027,6 +11248,34 @@ function renderBoardHtml(overview, token, options = {}) {
     }
   }
 
+  /*
+   * The header line, refreshed on its own because one part of it moves without the data moving.
+   *
+   * "checked 42s ago" is a clock, and apply() repaints only when the board's signature changes,
+   * so between two checks a minute apart the clock sat still and then jumped a minute. Putting
+   * the elapsed time into the signature instead would force a full repaint every few seconds
+   * purely to retype a string, and would fight the guard that stops an open form being rebuilt.
+   */
+  function paintSummary() {
+    document.getElementById('title').textContent = 'All services';
+    var parts = [];
+    if (data.total === 0) parts.push('nothing configured yet');
+    else {
+      // Counted, not inferred. This was total minus failing, which called a slow service healthy
+      // and slow at once, so a board of eleven read "9 of 11 healthy · 1 slow · 2 failing".
+      parts.push(data.healthy + ' of ' + data.total + ' healthy');
+      if (data.slow) parts.push(data.slow + ' slow');
+      if (data.failing) parts.push(data.failing + ' failing');
+      // Said separately, or a service with no URL would be counted nowhere and show as a grey
+      // card the summary never mentions.
+      if (data.misconfigured) parts.push(data.misconfigured + ' not configured');
+    }
+    // One clock for the board, because there is one round.
+    var freshest = newestCheck(data.services);
+    if (freshest) parts.push('checked ' + agoOf(freshest));
+    document.getElementById('subtitle').textContent = parts.join(' · ');
+  }
+
   function moveControl(glyph, id, delta, disabled) {
     var control = el('span', disabled ? 'off' : '', glyph);
     control.setAttribute('role', 'button');
@@ -11082,15 +11331,7 @@ function renderBoardHtml(overview, token, options = {}) {
     detail.className = 'grid';
     detail.textContent = '';
 
-    document.getElementById('title').textContent = 'All services';
-    var parts = [];
-    if (data.total === 0) parts.push('nothing configured yet');
-    else {
-      parts.push(data.total - data.failing + ' of ' + data.total + ' healthy');
-      if (data.slow) parts.push(data.slow + ' slow');
-      if (data.failing) parts.push(data.failing + ' failing');
-    }
-    document.getElementById('subtitle').textContent = parts.join(' · ');
+    paintSummary();
 
     if (!data.services.length) {
       var note = el('div', 'empty',
@@ -11112,11 +11353,21 @@ function renderBoardHtml(overview, token, options = {}) {
         var dot = el('i', 'dot');
         dot.setAttribute('data-state', service.state);
         state.appendChild(dot);
+        /*
+         * No timestamp on the card.
+         *
+         * It appeared only when a service was more than fifteen seconds behind the newest check,
+         * which is a rule nobody can see: from the outside some cards carry a time and others do
+         * not, for no reason the window ever states. And it was a relative time on a view that
+         * repaints only when the data changes, so it sat frozen between checks. The board's one
+         * clock is in the header, where it now ticks.
+         */
         state.appendChild(el('span', null, service.stateLabel));
         card.appendChild(state);
 
-        var failing = service.state === 'down' || service.state === 'warning'
-          || service.state === 'config-error';
+        // Config error is not here: it has no failures to count, having never been checked, so it
+        // takes the latency branch below and shows a dash like anything else with no reading.
+        var failing = service.state === 'down' || service.state === 'warning';
         var figure;
         if (failing && service.consecutiveFailures > 0) {
           // A failing service's latency is the time it took to fail, which is not a number worth
@@ -11132,9 +11383,36 @@ function renderBoardHtml(overview, token, options = {}) {
         card.appendChild(figure);
 
         card.setAttribute('data-state', service.state);
-        card.appendChild(el('div', 'meta',
-          (service.uptimePct === null ? 'no checks' : service.uptimePct + '% up')
-          + ' · ' + agoOf(service.lastCheckedAt)));
+
+        /*
+         * The meta line says only what deviates.
+         *
+         * "100% up" is six identical lines on a healthy board and says nothing; below 100 it is
+         * often the most interesting thing on the card, which is how a service reading Healthy at
+         * 67% up gets noticed. The timestamp moved to the header, because one round means one
+         * clock, and it comes back per card only when this service is out of step with the round
+         * — which is a real fault worth showing, not the timer ticking.
+         */
+        /*
+         * The footing: three figures over the same window of checks, on every card.
+         *
+         * Uptime is here unconditionally. Hiding it at 100% was a mistake worth recording: it
+         * saved a line on the cards that needed no attention and took the figure away from the
+         * ones that did, because a reader cannot tell "100%" from "not shown" without knowing the
+         * rule. A column of percentages is also comparable down the grid, which a column of
+         * sometimes-percentages is not.
+         *
+         * Median is what gives the big number meaning. 1193ms means something different against a
+         * median of 240 than against a median of 1150, and the card could not say which.
+         */
+        var stats = el('div', 'stats');
+        stats.appendChild(statCell('uptime',
+          service.uptimePct === null ? '—' : service.uptimePct + '%'));
+        stats.appendChild(statCell('median',
+          service.medianMs === null ? '—' : service.medianMs, 'ms'));
+        stats.appendChild(statCell(service.slowChecks ? 'slow' : 'checks',
+          service.slowChecks ? service.slowChecks + '/' + service.checks : service.checks));
+        card.appendChild(stats);
 
         /*
          * The reason lives on hover, not on the card.
@@ -11145,11 +11423,15 @@ function renderBoardHtml(overview, token, options = {}) {
          */
         if (service.lastError) card.title = service.name + ' — ' + service.lastError;
 
-        if (service.spark.length) {
-          var holder = document.createElement('div');
-          holder.innerHTML = sparkSvg(service.spark);
-          if (holder.firstChild) card.appendChild(holder.firstChild);
-        }
+        /*
+         * No sparkline here. It was the heaviest ink on the view and the least readable thing on
+         * it: twenty-four bars in a 239px card is a texture, and the two things you can sense
+         * from it — whether there is red in it, and whether it is spiky — are already on the card
+         * as the uptime percentage and the state. What it adds over those is the *shape* of a
+         * failure, flapping against hard-down, and that is what the service view is for, at a size
+         * where it can be read and with the table underneath it. Eleven services put 264 marks on
+         * screen to say something the numbers had already said.
+         */
 
         card.addEventListener('click', function () { select(service.id); });
         detail.appendChild(card);
@@ -11223,6 +11505,26 @@ function renderBoardHtml(overview, token, options = {}) {
   }
 
   /* ── forms ───────────────────────────────────────────────────────────── */
+
+  /*
+   * What each setting does, on hover.
+   *
+   * These are the fields nobody can infer from a label: "Amber after" says nothing about what
+   * happens below the threshold, and "Healthy after" is meaningless without knowing it counts
+   * successes rather than checks. The alternative was a line of prose under every input, which is
+   * six lines of text to answer a question asked once.
+   */
+  var TIPS = {
+    expectedStatusCode: 'The HTTP status a check must return to count as a pass.',
+    timeoutMs: 'How long to wait for a response before the check counts as failed.',
+    slowThresholdMs: 'A check that passes but takes longer than this is Slow rather than Healthy.',
+    amberAfterFailures: 'Consecutive failures before the service turns Warning. Below this, a '
+      + 'failure leaves the state alone.',
+    redAfterFailures: 'Consecutive failures before the service turns Down.',
+    recoverAfterSuccesses: 'Consecutive successes before a failing service is believed again. '
+      + '1 recovers on the first passing check.',
+    expectedBodyContains: 'Text the response body must contain. Blank skips the body check.'
+  };
 
   function field(label, hint) {
     var wrap = el('div', 'field');
@@ -11311,21 +11613,46 @@ function renderBoardHtml(overview, token, options = {}) {
     advanced.appendChild(el('summary', null, 'Overrides for this service'));
 
     var d = data.defaults;
-    var status = field('Expected status', 'board: ' + d.expectedStatusCode);
-    var timeout = field('Timeout (ms)', 'board: ' + d.timeoutMs);
-    var slow = field('Slow over (ms)', 'board: ' + d.slowThresholdMs);
-    var amber = field('Amber after', 'board: ' + d.amberAfterFailures);
-    var red = field('Red after', 'board: ' + d.redAfterFailures);
-    var body = field('Body contains', d.expectedBodyContains ? 'board: ' + d.expectedBodyContains : 'board: not checked');
-    var fields = [status, timeout, slow, amber, red, body];
+    var status = field('Expected status');
+    var timeout = field('Timeout (ms)');
+    var slow = field('Slow over (ms)');
+    var amber = field('Amber after');
+    var red = field('Red after');
+    var recover = field('Healthy after');
+    var body = field('Body contains');
+    var fields = [status, timeout, slow, amber, red, recover, body];
     var keys = ['expectedStatusCode', 'timeoutMs', 'slowThresholdMs', 'amberAfterFailures',
-                'redAfterFailures', 'expectedBodyContains'];
+                'redAfterFailures', 'recoverAfterSuccesses', 'expectedBodyContains'];
     for (var f = 0; f < fields.length; f++) {
-      var stored = config ? config[keys[f]] : null;
+      var key = keys[f];
+      var stored = config ? config[key] : null;
       fields[f].input.value = stored === null || stored === undefined ? '' : String(stored);
-      fields[f].input.placeholder = 'inherit';
-      advanced.appendChild(fields[f].wrap);
+      /*
+       * The board's value *is* the placeholder, rather than the word "inherit" with the value
+       * spelled out beside it.
+       *
+       * It puts the number where the number goes, and greyed against typed is already the
+       * difference between inheriting and overriding, so the row needs no second line to say
+       * which it is. That retired six hint lines from this form.
+       */
+      var inherited = d[key];
+      fields[f].input.placeholder =
+        inherited === '' || inherited === null || inherited === undefined
+          ? 'not checked' : String(inherited);
+      // No escape sequences in here, not even in this comment. Everything in this file is inside
+      // a template literal, so an escaped newline becomes a real one: in a string it breaks the
+      // quote across two lines, and in a comment it ends the comment and leaves the rest of the
+      // sentence as code. The second one still parses, so the page test does not catch it.
+      fields[f].wrap.title = TIPS[key]
+        + '  Board default: ' + fields[f].input.placeholder + '. Leave blank to inherit it.';
     }
+    var numrow = el('div', 'numrow');
+    var numbers = el('div', 'numgrid');
+    var numeric = [status, timeout, slow, amber, red, recover];
+    for (var g = 0; g < numeric.length; g++) numbers.appendChild(numeric[g].wrap);
+    numrow.appendChild(numbers);
+    advanced.appendChild(numrow);
+    advanced.appendChild(body.wrap);
     var snippet = checkField('Body snippet', 'store the response body in this service\u2019s history',
       config && config.showBodySnippetInHistory !== null
         ? config.showBodySnippetInHistory : d.showBodySnippetInHistory);
@@ -11375,6 +11702,7 @@ function renderBoardHtml(overview, token, options = {}) {
         slowThresholdMs: overrideValue(slow.input.value),
         amberAfterFailures: overrideValue(amber.input.value),
         redAfterFailures: overrideValue(red.input.value),
+        recoverAfterSuccesses: overrideValue(recover.input.value),
         expectedBodyContains: body.input.value.trim() === '' ? null : body.input.value,
         showBodySnippetInHistory: snippet.input.checked
       };
@@ -11402,7 +11730,8 @@ function renderBoardHtml(overview, token, options = {}) {
 
   function hasOverrides(config) {
     var keys = ['expectedStatusCode', 'timeoutMs', 'slowThresholdMs', 'amberAfterFailures',
-                'redAfterFailures', 'expectedBodyContains', 'showBodySnippetInHistory'];
+                'redAfterFailures', 'recoverAfterSuccesses', 'expectedBodyContains',
+                'showBodySnippetInHistory'];
     for (var i = 0; i < keys.length; i++) {
       if (config[keys[i]] !== null && config[keys[i]] !== undefined) return true;
     }
@@ -11437,13 +11766,29 @@ function renderBoardHtml(overview, token, options = {}) {
     amber.input.value = String(d.amberAfterFailures);
     var red = field('Red after', 'failures');
     red.input.value = String(d.redAfterFailures);
+    var recover = field('Healthy after', 'successes');
+    recover.input.value = String(d.recoverAfterSuccesses);
     var body = field('Body contains', 'blank to skip the body');
     body.input.value = d.expectedBodyContains;
     var snippet = checkField('Body snippet', 'store response bodies in history',
       d.showBodySnippetInHistory);
 
-    var rows = [name, frequency, status, timeout, slow, amber, red, body, snippet];
-    for (var i = 0; i < rows.length; i++) detail.appendChild(rows[i].wrap);
+    detail.appendChild(name.wrap);
+    detail.appendChild(frequency.wrap);
+    var numrow = el('div', 'numrow');
+    var numbers = el('div', 'numgrid');
+    var numeric = [status, timeout, slow, amber, red, recover];
+    var numKeys = ['expectedStatusCode', 'timeoutMs', 'slowThresholdMs', 'amberAfterFailures',
+                   'redAfterFailures', 'recoverAfterSuccesses'];
+    for (var i = 0; i < numeric.length; i++) {
+      numeric[i].wrap.title = TIPS[numKeys[i]];
+      numbers.appendChild(numeric[i].wrap);
+    }
+    numrow.appendChild(numbers);
+    detail.appendChild(numrow);
+    body.wrap.title = TIPS.expectedBodyContains;
+    detail.appendChild(body.wrap);
+    detail.appendChild(snippet.wrap);
 
     var error = el('div', 'error');
     var actions = el('div', 'form-actions');
@@ -11467,12 +11812,18 @@ function renderBoardHtml(overview, token, options = {}) {
           slowThresholdMs: overrideValue(slow.input.value) || d.slowThresholdMs,
           amberAfterFailures: overrideValue(amber.input.value) || d.amberAfterFailures,
           redAfterFailures: overrideValue(red.input.value) || d.redAfterFailures,
+          recoverAfterSuccesses:
+            overrideValue(recover.input.value) || d.recoverAfterSuccesses,
           expectedBodyContains: body.input.value,
           showBodySnippetInHistory: snippet.input.checked
         }
       };
       if (update.defaults.redAfterFailures < update.defaults.amberAfterFailures) {
         error.textContent = 'Red must be at least as many failures as amber.';
+        return;
+      }
+      if (update.defaults.recoverAfterSuccesses < 1) {
+        error.textContent = 'Healthy after must be at least one success.';
         return;
       }
       save.disabled = true;
@@ -11566,6 +11917,9 @@ function renderBoardHtml(overview, token, options = {}) {
     var changed = signature(next) !== lastSignature;
     data = next;
     lastSignature = signature(next);
+    // Ahead of the early return: the clock in the header is the one thing that moves while the
+    // board stands still.
+    if (view === 'list' && selected === null) paintSummary();
     if (!changed) return;
     /*
      * A form owns the pane for as long as it is open.
@@ -12101,17 +12455,27 @@ let HealthBoardAction = (() => {
                 return;
             }
             instance.inFlight.add(serviceId);
+            const previousState = runtime.currentState;
             runtime.currentState = "checking";
             instance.settings.runtime[serviceId] = runtime;
             await this.drawKey(keyAction, instance);
             try {
                 const result = await runHealthCheck(resolved);
                 const failures = result.ok ? 0 : runtime.consecutiveFailures + 1;
-                const record = buildCheckRecord(result, evaluateButtonState(resolved, failures, buildCheckRecord(result, "unknown")));
+                const successes = result.ok ? runtime.consecutiveSuccesses + 1 : 0;
+                // `runtime.currentState` was set to "checking" above, so the state to judge against is the
+                // one captured before that, not what is on the runtime now.
+                const record = buildCheckRecord(result, evaluateButtonState(resolved, {
+                    consecutiveFailures: failures,
+                    consecutiveSuccesses: successes,
+                    previousState,
+                    lastRecord: buildCheckRecord(result, "unknown"),
+                }));
                 instance.settings.runtime[serviceId] = {
                     history: appendRecord(runtime.history, record),
                     currentState: record.state,
                     consecutiveFailures: failures,
+                    consecutiveSuccesses: successes,
                     lastCheckedAt: record.timestamp,
                     lastStatusCode: result.statusCode,
                     lastResponseTimeMs: result.responseTimeMs,

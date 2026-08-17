@@ -122,10 +122,12 @@ describe("renderBoardIcon", () => {
     }
   });
 
-  it("draws warning and down in the same red, since the key carries four colours", () => {
-    // Deliberate: orange against amber was unreadable at cell size. How long something has been
-    // failing is a question for the window, not for a small square.
-    expect(fills(["warning"])[0]).toBe(fills(["down"])[0]);
+  it("gives warning its own colour, matching the window", () => {
+    // These shared red while slow and warning were 15 degrees of hue apart at the same lightness,
+    // which was unreadable at cell size. Separating that pair on lightness too is what let the key
+    // carry the state, so the thing to hold onto is that all four stay distinct from each other.
+    const shades = ["healthy", "slow", "warning", "down"].map((s) => fills([s as CellState])[0]);
+    expect(new Set(shades).size).toBe(4);
   });
 
   it("keeps healthy, slow and failing distinct from each other", () => {

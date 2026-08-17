@@ -31,6 +31,7 @@ export function newService(name: string, url: string): ServiceConfig {
     slowThresholdMs: null,
     amberAfterFailures: null,
     redAfterFailures: null,
+    recoverAfterSuccesses: null,
     expectedBodyContains: null,
     showBodySnippetInHistory: null,
   };
@@ -68,12 +69,16 @@ export function resolveService(
       DEFAULT_BOARD_DEFAULTS.amberAfterFailures),
     redAfterFailures: num(inherit(service.redAfterFailures, defaults.redAfterFailures),
       DEFAULT_BOARD_DEFAULTS.redAfterFailures),
+    recoverAfterSuccesses: num(
+      inherit(service.recoverAfterSuccesses, defaults.recoverAfterSuccesses),
+      DEFAULT_BOARD_DEFAULTS.recoverAfterSuccesses),
     expectedBodyContains: inherit(service.expectedBodyContains, defaults.expectedBodyContains),
     showBodySnippetInHistory:
       inherit(service.showBodySnippetInHistory, defaults.showBodySnippetInHistory),
     history: runtime.history ?? [],
     currentState: runtime.currentState ?? "unknown",
     consecutiveFailures: runtime.consecutiveFailures ?? 0,
+    consecutiveSuccesses: runtime.consecutiveSuccesses ?? 0,
     lastCheckedAt: runtime.lastCheckedAt ?? null,
     lastStatusCode: runtime.lastStatusCode ?? null,
     lastResponseTimeMs: runtime.lastResponseTimeMs ?? null,

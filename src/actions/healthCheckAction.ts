@@ -213,10 +213,15 @@ export class HealthCheckAction extends SingletonAction<HealthCheckSettings> {
       instance.isChecking = false;
     }
 
+    // Captured before the counters move, because the recovery threshold is judged against where
+    // the service was, not where this check is about to put it.
+    const previousState = instance.settings.currentState;
     if (result.ok) {
       instance.settings.consecutiveFailures = 0;
+      instance.settings.consecutiveSuccesses = (instance.settings.consecutiveSuccesses ?? 0) + 1;
     } else {
       instance.settings.consecutiveFailures += 1;
+      instance.settings.consecutiveSuccesses = 0;
     }
 
     const tempRecord: CheckRecord = {
@@ -230,11 +235,12 @@ export class HealthCheckAction extends SingletonAction<HealthCheckSettings> {
       error: result.error,
     };
 
-    const newState = evaluateButtonState(
-      instance.settings,
-      instance.settings.consecutiveFailures,
-      tempRecord
-    );
+    const newState = evaluateButtonState(instance.settings, {
+      consecutiveFailures: instance.settings.consecutiveFailures,
+      consecutiveSuccesses: instance.settings.consecutiveSuccesses,
+      previousState,
+      lastRecord: tempRecord,
+    });
 
     const record = buildCheckRecord(result, newState);
 
@@ -283,6 +289,8 @@ function mergeWithDefaults(
     slowThresholdMs:    Number(base.slowThresholdMs)    || DEFAULT_SETTINGS.slowThresholdMs,
     amberAfterFailures: Number(base.amberAfterFailures) || DEFAULT_SETTINGS.amberAfterFailures,
     redAfterFailures:   Number(base.redAfterFailures)   || DEFAULT_SETTINGS.redAfterFailures,
+    recoverAfterSuccesses:
+      Number(base.recoverAfterSuccesses) || DEFAULT_SETTINGS.recoverAfterSuccesses,
   };
 }
 

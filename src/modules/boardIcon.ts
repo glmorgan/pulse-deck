@@ -43,20 +43,31 @@ const SIZE = 144;
 const EMPTY_GRID = { cols: 3, rows: 3 } as const;
 
 /**
- * Four colours, no more: green, amber, red, grey.
+ * One colour per state the key can usefully tell apart: green, yellow, orange, red, grey.
  *
- * The window distinguishes five states, but a small cell cannot. Warning and down were adjacent
- * hues at similar lightness — orange against amber — and telling them apart at this size was
- * guesswork, worse for anyone red/green colourblind. So a failing check is red whether or not it
- * has passed the red threshold, and how long it has been failing is a question for the window.
+ * Warning used to share red with down, and the reason was measured rather than assumed: with slow
+ * at #fab219 and warning at an orange of the same lightness, the two sat 15 degrees of hue apart
+ * with nothing else separating them, and at cell size that was guesswork. Dropping warning into
+ * red was the cheap fix.
+ *
+ * The window's palette then moved both of them: slow toward a true yellow and up in lightness,
+ * warning toward red and down in lightness, about 25 degrees and 11 points apart. That is the pair
+ * that failed before, separated on two axes instead of one, so the key can carry it now and the
+ * two surfaces of the plugin agree about what a warning looks like.
+ *
+ * Warning and down are still the pair to watch here: they differ by hue and by lightness, but a
+ * cell is 20×14 device pixels on the hardware and the window is where a failing service says how
+ * long it has been failing.
  *
  * `checking` sits with the greys rather than getting a colour of its own: a key image is a still,
  * and the state lasts a few hundred milliseconds.
  */
 const CELL_FILL: Record<CellState, string> = {
   healthy: "#4cc94c",
-  slow: "#fab219",
-  warning: "#d03b3b",
+  // These three are the window's --slow, --warn and --fail verbatim. Two surfaces of one plugin
+  // disagreeing about what a state looks like is worse than any choice either could make alone.
+  slow: "#f0cc35",
+  warning: "#d1621b",
   down: "#d03b3b",
   checking: "#5a5a5a",
   unknown: "#4a4a4a",

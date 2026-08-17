@@ -35,6 +35,16 @@ export interface ServiceCard {
   lastCheckedAt: string | null;
   uptimePct: number | null;
   checks: number;
+  /**
+   * Median of the successful checks, which is what makes the current latency mean anything.
+   *
+   * 1193ms is alarming next to a median of 240 and unremarkable next to a median of 1150, and the
+   * card cannot say which without carrying both. A failure is excluded: the time a request took
+   * to fail is not a latency.
+   */
+  medianMs: number | null;
+  /** Successful checks slower than this service's resolved threshold, over the same window. */
+  slowChecks: number;
   consecutiveFailures: number;
   /** Why it is failing, for a card that has room to say so. Null when the last check passed. */
   lastError: string | null;
@@ -48,6 +58,9 @@ export interface BoardOverview {
   total: number;
   failing: number;
   slow: number;
+  healthy: number;
+  /** Services with no usable URL, which are not failing: they are not being checked at all. */
+  misconfigured: number;
   /** How many services a board may hold, so the window can retire its own Add control. */
   capacity: number;
   /**
@@ -89,6 +102,8 @@ export function buildBoardOverview(
       lastCheckedAt: runtime.lastCheckedAt,
       uptimePct: stats.uptimePct,
       checks: stats.total,
+      medianMs: stats.median,
+      slowChecks: stats.overThreshold,
       consecutiveFailures: runtime.consecutiveFailures,
       lastError: lastErrorOf(runtime.history ?? [], service),
       spark: (runtime.history ?? []).slice(-SPARK_POINTS).map((record) => ({
@@ -108,9 +123,17 @@ export function buildBoardOverview(
     configs: settings.services,
     total: services.length,
     // Slow is not failing — it answered. Kept apart so the header can say both.
-    failing: services.filter((s) =>
-      s.state === "down" || s.state === "warning" || s.state === "config-error").length,
+    //
+    // Nor is a configuration error, which used to be counted here: nothing is wrong with the
+    // endpoint, we never asked it anything. Counting it as failing put a setup mistake and a real
+    // outage in the same number on a board whose whole job is telling you which you have.
+    failing: services.filter((s) => s.state === "down" || s.state === "warning").length,
+    misconfigured: services.filter((s) => s.state === "config-error").length,
     slow: services.filter((s) => s.state === "slow").length,
+    // Counted rather than left to the header to infer. `total - failing` counted a slow service
+    // as healthy as well as slow, so the three numbers summed to more than the board held. The
+    // remainder here is the never-checked and the mid-check, which the header simply omits.
+    healthy: services.filter((s) => s.state === "healthy").length,
     generatedAt: Date.now(),
   };
 }

@@ -33,12 +33,15 @@ export interface HealthCheckSettings {
   slowThresholdMs: number;
   amberAfterFailures: number;
   redAfterFailures: number;
+  /** Consecutive successes before a failing service is believed again. 1 is no damping. */
+  recoverAfterSuccesses: number;
   expectedBodyContains: string;
   showBodySnippetInHistory: boolean;
   // Persisted runtime state
   history: CheckRecord[];
   currentState: ButtonState;
   consecutiveFailures: number;
+  consecutiveSuccesses: number;
   lastCheckedAt: string | null;
   lastStatusCode: number | null;
   lastResponseTimeMs: number | null;
@@ -53,11 +56,15 @@ export const DEFAULT_SETTINGS: HealthCheckSettings = {
   slowThresholdMs: 1000,
   amberAfterFailures: 1,
   redAfterFailures: 3,
+  // 1 is the behaviour that shipped before this setting existed, so an existing button whose
+  // settings predate it is unaffected by the coercion in mergeWithDefaults.
+  recoverAfterSuccesses: 1,
   expectedBodyContains: "",
   showBodySnippetInHistory: false,
   history: [],
   currentState: "unknown",
   consecutiveFailures: 0,
+  consecutiveSuccesses: 0,
   lastCheckedAt: null,
   lastStatusCode: null,
   lastResponseTimeMs: null,
