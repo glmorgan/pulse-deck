@@ -30,6 +30,7 @@ import {
 import {
   clearTimer,
   getIntervalMs,
+  msUntilDue,
   startTimer,
 } from "../modules/timerManager.js";
 import { getIcon } from "../modules/iconGenerator.js";
@@ -58,6 +59,7 @@ export class HealthCheckAction extends SingletonAction<HealthCheckSettings> {
       isChecking: false,
       keyDownAt: null,
       timer: null,
+      dueTimer: null,
       closeWindow: null,
     };
     this.instances.set(id, instance);
@@ -66,10 +68,6 @@ export class HealthCheckAction extends SingletonAction<HealthCheckSettings> {
       ? "config-error"
       : settings.currentState;
     await renderState(keyAction, initialState, settings);
-
-    if (settings.checkFrequency !== "manual") {
-      setTimeout(() => void this.triggerCheck(id, keyAction), INITIAL_CHECK_DELAY_MS);
-    }
 
     this.resetTimer(id, keyAction);
   }
@@ -81,6 +79,7 @@ export class HealthCheckAction extends SingletonAction<HealthCheckSettings> {
     const instance = this.instances.get(id);
     if (instance) {
       clearTimer(instance.timer);
+      if (instance.dueTimer) clearTimeout(instance.dueTimer);
       // A window outlives its key otherwise: the page would keep polling a snapshot that has
       // stopped moving, and Check now would silently do nothing.
       instance.closeWindow?.();
@@ -256,6 +255,14 @@ export class HealthCheckAction extends SingletonAction<HealthCheckSettings> {
 
   // ── Timer management ──────────────────────────────────────────────────────
 
+  /**
+   * Schedules the next check from when the *last* one ran, not from now.
+   *
+   * This runs on every willAppear, and willAppear fires whenever a folder is opened, a profile
+   * switches, or the app redraws its pages — none of which are reasons to check a service. The
+   * first check is put at whatever remains of the interval, so returning to a page five times
+   * costs nothing, and a key that is genuinely due still goes almost immediately.
+   */
   private resetTimer(
     id: string,
     keyAction: KeyAction<HealthCheckSettings>
@@ -265,13 +272,26 @@ export class HealthCheckAction extends SingletonAction<HealthCheckSettings> {
 
     clearTimer(instance.timer);
     instance.timer = null;
+    if (instance.dueTimer) clearTimeout(instance.dueTimer);
+    instance.dueTimer = null;
 
     const intervalMs = getIntervalMs(instance.settings.checkFrequency);
-    if (intervalMs !== null) {
+    if (intervalMs === null) return;
+
+    const dueIn = msUntilDue(
+      instance.settings.lastCheckedAt,
+      intervalMs,
+      INITIAL_CHECK_DELAY_MS
+    );
+    instance.dueTimer = setTimeout(() => {
+      instance.dueTimer = null;
+      void this.triggerCheck(id, keyAction);
+      // The repeating clock starts once the key is back on schedule, so the interval is measured
+      // from a real check rather than from whenever the key happened to appear.
       instance.timer = startTimer(intervalMs, () => {
         void this.triggerCheck(id, keyAction);
       });
-    }
+    }, dueIn);
   }
 }
 

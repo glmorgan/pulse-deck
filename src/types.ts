@@ -76,6 +76,8 @@ export interface KeyInstance {
   isChecking: boolean;
   keyDownAt: number | null;
   timer: ReturnType<typeof setInterval> | null;
+  /** The one-shot that fires the next due check, before the repeating clock takes over. */
+  dueTimer: ReturnType<typeof setTimeout> | null;
   /** Dismisses this key's open history window; null when no window is up. */
   closeWindow: (() => void) | null;
 }

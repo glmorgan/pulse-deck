@@ -10070,6 +10070,37 @@ function getIntervalMs(frequency) {
 function startTimer(intervalMs, callback) {
     return setInterval(callback, intervalMs);
 }
+/**
+ * How long until a key is next due a check, given when it last had one.
+ *
+ * `willAppear` fires far more often than people expect: every time a folder is opened or closed,
+ * a profile switches, or the Stream Deck app redraws its pages. Each one used to schedule a check
+ * a second and a half later regardless of when the last one ran, so walking in and out of a folder
+ * five times ran five extra checks — wasted requests against someone else's service, and five
+ * slots gone from a 60-record window that on an hourly key is meant to cover two and a half days.
+ *
+ * So the schedule is anchored to the last check rather than to the moment the key appeared: a key
+ * checked 50 minutes ago on an hourly interval waits the remaining 10 minutes, and one that has
+ * never been checked, or is overdue, goes after the short settling delay.
+ *
+ * @param minDelayMs A floor on the answer, so a check never fires while the plugin is still
+ * starting up and the key has not finished drawing.
+ */
+function msUntilDue(lastCheckedAt, intervalMs, minDelayMs) {
+    if (!lastCheckedAt)
+        return minDelayMs;
+    const last = Date.parse(lastCheckedAt);
+    // An unparseable timestamp is treated as no timestamp rather than as the epoch, which would
+    // read as wildly overdue and check immediately every time.
+    if (!Number.isFinite(last))
+        return minDelayMs;
+    // A clock that has gone backwards, or a timestamp from the future, must not park a key for
+    // hours: anything that is not a sane elapsed time falls back to checking now.
+    const elapsed = Date.now() - last;
+    if (elapsed < 0 || elapsed >= intervalMs)
+        return minDelayMs;
+    return Math.max(minDelayMs, intervalMs - elapsed);
+}
 function clearTimer(timer) {
     if (timer !== null)
         clearInterval(timer);
@@ -10119,6 +10150,7 @@ let HealthCheckAction = (() => {
                 isChecking: false,
                 keyDownAt: null,
                 timer: null,
+                dueTimer: null,
                 closeWindow: null,
             };
             this.instances.set(id, instance);
@@ -10126,9 +10158,6 @@ let HealthCheckAction = (() => {
                 ? "config-error"
                 : settings.currentState;
             await renderState(keyAction, initialState, settings);
-            if (settings.checkFrequency !== "manual") {
-                setTimeout(() => void this.triggerCheck(id, keyAction), INITIAL_CHECK_DELAY_MS$1);
-            }
             this.resetTimer(id, keyAction);
         }
         async onWillDisappear(ev) {
@@ -10136,6 +10165,8 @@ let HealthCheckAction = (() => {
             const instance = this.instances.get(id);
             if (instance) {
                 clearTimer(instance.timer);
+                if (instance.dueTimer)
+                    clearTimeout(instance.dueTimer);
                 // A window outlives its key otherwise: the page would keep polling a snapshot that has
                 // stopped moving, and Check now would silently do nothing.
                 instance.closeWindow?.();
@@ -10286,18 +10317,36 @@ let HealthCheckAction = (() => {
             await keyAction.setSettings(instance.settings);
         }
         // ── Timer management ──────────────────────────────────────────────────────
+        /**
+         * Schedules the next check from when the *last* one ran, not from now.
+         *
+         * This runs on every willAppear, and willAppear fires whenever a folder is opened, a profile
+         * switches, or the app redraws its pages — none of which are reasons to check a service. The
+         * first check is put at whatever remains of the interval, so returning to a page five times
+         * costs nothing, and a key that is genuinely due still goes almost immediately.
+         */
         resetTimer(id, keyAction) {
             const instance = this.instances.get(id);
             if (!instance)
                 return;
             clearTimer(instance.timer);
             instance.timer = null;
+            if (instance.dueTimer)
+                clearTimeout(instance.dueTimer);
+            instance.dueTimer = null;
             const intervalMs = getIntervalMs(instance.settings.checkFrequency);
-            if (intervalMs !== null) {
+            if (intervalMs === null)
+                return;
+            const dueIn = msUntilDue(instance.settings.lastCheckedAt, intervalMs, INITIAL_CHECK_DELAY_MS$1);
+            instance.dueTimer = setTimeout(() => {
+                instance.dueTimer = null;
+                void this.triggerCheck(id, keyAction);
+                // The repeating clock starts once the key is back on schedule, so the interval is measured
+                // from a real check rather than from whenever the key happened to appear.
                 instance.timer = startTimer(intervalMs, () => {
                     void this.triggerCheck(id, keyAction);
                 });
-            }
+            }, dueIn);
         }
     });
     return _classThis;
@@ -12157,15 +12206,13 @@ let HealthBoardAction = (() => {
                 inFlight: new Set(),
                 roundRunning: false,
                 saveTimer: null,
+                dueTimer: null,
                 windowOpen: false,
                 closeWindow: null,
                 lastDeleted: null,
             };
             this.instances.set(keyAction.id, instance);
             await this.drawKey(keyAction, instance);
-            if (instance.settings.services.length > 0) {
-                setTimeout(() => void this.runRound(keyAction.id, keyAction), INITIAL_CHECK_DELAY_MS);
-            }
             this.resetTimer(keyAction.id, keyAction);
         }
         async onWillDisappear(ev) {
@@ -12175,6 +12222,8 @@ let HealthBoardAction = (() => {
             clearTimer(instance.timer);
             if (instance.saveTimer)
                 clearTimeout(instance.saveTimer);
+            if (instance.dueTimer)
+                clearTimeout(instance.dueTimer);
             // A window outlives its key otherwise, polling a board that has stopped moving.
             instance.closeWindow?.();
             this.instances.delete(ev.action.id);
@@ -12505,16 +12554,33 @@ let HealthBoardAction = (() => {
         async drawKey(keyAction, instance) {
             await keyAction.setImage(renderBoardIcon(boardCells(instance.settings)));
         }
+        /**
+         * Schedules the next round from when the last one ran, not from now.
+         *
+         * willAppear fires whenever a folder opens, a profile switches, or the app redraws its pages,
+         * and a board runs a request per service — so re-checking on every appearance multiplies the
+         * waste by the size of the board. The round is anchored to the most recent check on the board
+         * instead: return to the page as often as you like and nothing is sent until something is
+         * actually due.
+         */
         resetTimer(id, keyAction) {
             const instance = this.instances.get(id);
             if (!instance)
                 return;
             clearTimer(instance.timer);
             instance.timer = null;
+            if (instance.dueTimer)
+                clearTimeout(instance.dueTimer);
+            instance.dueTimer = null;
             const intervalMs = getIntervalMs(instance.settings.defaults.checkFrequency);
-            if (intervalMs !== null) {
+            if (intervalMs === null || instance.settings.services.length === 0)
+                return;
+            const dueIn = msUntilDue(newestCheck(instance.settings), intervalMs, INITIAL_CHECK_DELAY_MS);
+            instance.dueTimer = setTimeout(() => {
+                instance.dueTimer = null;
+                void this.runRound(id, keyAction);
                 instance.timer = startTimer(intervalMs, () => void this.runRound(id, keyAction));
-            }
+            }, dueIn);
         }
     });
     return _classThis;
@@ -12530,6 +12596,22 @@ function hostOf(url) {
     catch {
         return "New service";
     }
+}
+/**
+ * The most recent check anywhere on the board, which is what the round's clock is anchored to.
+ *
+ * A round checks every service together, so the board has one schedule rather than twelve. A
+ * service added since the last round has no timestamp of its own and is checked on the spot when
+ * it is added, so it does not need to drag the whole board's clock forward.
+ */
+function newestCheck(settings) {
+    let newest = null;
+    for (const service of settings.services) {
+        const at = settings.runtime[service.id]?.lastCheckedAt;
+        if (at && (!newest || at > newest))
+            newest = at;
+    }
+    return newest;
 }
 
 streamDeck.actions.registerAction(new HealthCheckAction());

@@ -19,7 +19,7 @@ import {
   evaluateButtonState,
   validateSettings,
 } from "../modules/stateEvaluator.js";
-import { clearTimer, getIntervalMs, startTimer } from "../modules/timerManager.js";
+import { clearTimer, getIntervalMs, msUntilDue, startTimer } from "../modules/timerManager.js";
 import {
   boardCells,
   mergeBoardSettings,
@@ -73,6 +73,8 @@ interface BoardInstance {
   inFlight: Set<string>;
   roundRunning: boolean;
   saveTimer: ReturnType<typeof setTimeout> | null;
+  /** The one-shot that fires the next due round, before the repeating clock takes over. */
+  dueTimer: ReturnType<typeof setTimeout> | null;
   /** True from the moment a window is asked for, so a second press cannot open a second one. */
   windowOpen: boolean;
   /** Dismisses the open window when the key goes away. */
@@ -104,6 +106,7 @@ export class HealthBoardAction extends SingletonAction<BoardSettings> {
       inFlight: new Set(),
       roundRunning: false,
       saveTimer: null,
+      dueTimer: null,
       windowOpen: false,
       closeWindow: null,
       lastDeleted: null,
@@ -112,9 +115,6 @@ export class HealthBoardAction extends SingletonAction<BoardSettings> {
 
     await this.drawKey(keyAction, instance);
 
-    if (instance.settings.services.length > 0) {
-      setTimeout(() => void this.runRound(keyAction.id, keyAction), INITIAL_CHECK_DELAY_MS);
-    }
     this.resetTimer(keyAction.id, keyAction);
   }
 
@@ -123,6 +123,7 @@ export class HealthBoardAction extends SingletonAction<BoardSettings> {
     if (!instance) return;
     clearTimer(instance.timer);
     if (instance.saveTimer) clearTimeout(instance.saveTimer);
+    if (instance.dueTimer) clearTimeout(instance.dueTimer);
     // A window outlives its key otherwise, polling a board that has stopped moving.
     instance.closeWindow?.();
     this.instances.delete(ev.action.id);
@@ -480,15 +481,32 @@ export class HealthBoardAction extends SingletonAction<BoardSettings> {
     await keyAction.setImage(renderBoardIcon(boardCells(instance.settings)));
   }
 
+  /**
+   * Schedules the next round from when the last one ran, not from now.
+   *
+   * willAppear fires whenever a folder opens, a profile switches, or the app redraws its pages,
+   * and a board runs a request per service — so re-checking on every appearance multiplies the
+   * waste by the size of the board. The round is anchored to the most recent check on the board
+   * instead: return to the page as often as you like and nothing is sent until something is
+   * actually due.
+   */
   private resetTimer(id: string, keyAction: KeyAction<BoardSettings>): void {
     const instance = this.instances.get(id);
     if (!instance) return;
     clearTimer(instance.timer);
     instance.timer = null;
+    if (instance.dueTimer) clearTimeout(instance.dueTimer);
+    instance.dueTimer = null;
+
     const intervalMs = getIntervalMs(instance.settings.defaults.checkFrequency);
-    if (intervalMs !== null) {
+    if (intervalMs === null || instance.settings.services.length === 0) return;
+
+    const dueIn = msUntilDue(newestCheck(instance.settings), intervalMs, INITIAL_CHECK_DELAY_MS);
+    instance.dueTimer = setTimeout(() => {
+      instance.dueTimer = null;
+      void this.runRound(id, keyAction);
       instance.timer = startTimer(intervalMs, () => void this.runRound(id, keyAction));
-    }
+    }, dueIn);
   }
 }
 
@@ -503,4 +521,20 @@ function hostOf(url: string): string {
   } catch {
     return "New service";
   }
+}
+
+/**
+ * The most recent check anywhere on the board, which is what the round's clock is anchored to.
+ *
+ * A round checks every service together, so the board has one schedule rather than twelve. A
+ * service added since the last round has no timestamp of its own and is checked on the spot when
+ * it is added, so it does not need to drag the whole board's clock forward.
+ */
+function newestCheck(settings: BoardSettings): string | null {
+  let newest: string | null = null;
+  for (const service of settings.services) {
+    const at = settings.runtime[service.id]?.lastCheckedAt;
+    if (at && (!newest || at > newest)) newest = at;
+  }
+  return newest;
 }
