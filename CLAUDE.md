@@ -64,10 +64,16 @@ native/
 
 `HealthCheckAction` extends `SingletonAction<HealthCheckSettings>`. Per-key state is tracked in `instances: Map<actionId, KeyInstance>`.
 
-**Key press behaviour:**
-- Short press → immediate health check (ignores if check already in progress)
-- Long press (>500ms) → opens the history window (see below)
-- Auto-interval → background check on configured frequency
+**Key press behaviour** — the same on both actions, deliberately:
+- Short press → opens the window (history for a key, the board for a board)
+- Long press (>500ms) → checks now (every service, on a board)
+- Auto-interval → background check on the configured frequency, scheduled from the *last* check
+  rather than from when the key appeared — `willAppear` fires on every folder and profile change,
+  and re-checking on each one wasted requests and burned slots in the 60-record window
+
+Looking is on the short press because it is the common act and the safe one: a stray tap opens a
+window rather than sending a request to somebody else's service, which on a board would be one
+request per service.
 
 **Check flow:** validate config → set checking icon → fetch with AbortController timeout → compare status code → optionally check body → evaluate state → append to history → update icon and title → persist settings.
 

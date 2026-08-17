@@ -156,14 +156,23 @@ export class HealthBoardAction extends SingletonAction<BoardSettings> {
     const held = instance.keyDownAt !== null ? Date.now() - instance.keyDownAt : 0;
     instance.keyDownAt = null;
 
-    // An empty board has nothing to check, so the short press goes where the services are added.
-    if (held >= LONG_PRESS_MS || instance.settings.services.length === 0) {
-      // Not awaited: the window stays open until it is closed, and awaiting it here would hold
-      // the key's event handler for as long as someone is reading it.
-      void this.openManager(ev.action.id, ev.action);
+    /*
+     * Short press opens the board; holding checks it. The opposite way round to the
+     * single-endpoint key, deliberately.
+     *
+     * A board key is a dashboard: looking at it is the common act, and a round of checks is the
+     * rare, deliberate one. It is also the cheaper thing to do by accident — a stray tap opens a
+     * window you can close, where the other way round it fires a request per service at
+     * somebody else's endpoints. The single Health Check key keeps press-to-check, where a press
+     * is one request and checking is the whole point of the key.
+     */
+    if (held >= LONG_PRESS_MS && instance.settings.services.length > 0) {
+      await this.runRound(ev.action.id, ev.action);
       return;
     }
-    await this.runRound(ev.action.id, ev.action);
+    // Not awaited: the window stays open until it is closed, and awaiting it here would hold the
+    // key's event handler for as long as someone is reading it.
+    void this.openManager(ev.action.id, ev.action);
   }
 
   /**

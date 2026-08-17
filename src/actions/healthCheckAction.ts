@@ -122,13 +122,21 @@ export class HealthCheckAction extends SingletonAction<HealthCheckSettings> {
       : 0;
     instance.keyDownAt = null;
 
+    /*
+     * Short press opens the history; holding checks now. The same way round as the board key.
+     *
+     * These were the other way round until the board arrived, and two keys from one plugin
+     * disagreeing about what a press means is worse than either mapping. Looking is also the
+     * safer thing to do by accident: a stray tap opens a window, rather than sending a request to
+     * somebody else's service.
+     */
     if (pressDuration >= LONG_PRESS_MS) {
-      // Deliberately not awaited: the window stays open until it is closed, and awaiting it here
-      // would hold the key's event handler for as long as someone is reading the chart.
-      void this.openHistory(id, ev.action);
-    } else {
       await this.triggerCheck(id, ev.action);
+      return;
     }
+    // Deliberately not awaited: the window stays open until it is closed, and awaiting it here
+    // would hold the key's event handler for as long as someone is reading the chart.
+    void this.openHistory(id, ev.action);
   }
 
   // ── History window ────────────────────────────────────────────────────────

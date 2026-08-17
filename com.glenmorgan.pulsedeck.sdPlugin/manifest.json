@@ -9,7 +9,7 @@
       "Name": "Health Check",
       "UUID": "com.glenmorgan.pulsedeck.healthcheck",
       "Icon": "imgs/actions/healthcheck/action",
-      "Tooltip": "Monitor an HTTP health check endpoint. Press to check now, long-press for history.",
+      "Tooltip": "Monitor an HTTP health check endpoint. Press to open the history, hold to check now.",
       "Controllers": [
         "Keypad"
       ],
@@ -27,7 +27,7 @@
       "Name": "Health Board",
       "UUID": "com.glenmorgan.pulsedeck.healthboard",
       "Icon": "imgs/actions/healthcheck/action",
-      "Tooltip": "Monitor up to nine endpoints on one key. Press to check all, hold to manage.",
+      "Tooltip": "Monitor up to twelve endpoints on one key. Press to open the board, hold to check every service.",
       "Controllers": [
         "Keypad"
       ],
