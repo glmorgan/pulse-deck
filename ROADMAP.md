@@ -81,12 +81,37 @@ is likely to refuse it and the plugin silently falls back to a browser window. F
 Developer ID certificate and a notarization step in `native/build.sh`. This is the main thing
 standing between the alpha and a release anyone else can install.
 
-## Requests with more than a URL
+## More control over the request
 
-Real health endpoints often want a header (an API key, a tenant id), a method other than GET, or
-a body. Small to add to the checker; the cost is in the form, which is already the longest surface
-in the window, and in deciding whether a header holding a secret belongs in settings that travel
-with a profile export.
+Real health endpoints often want more than a URL, and the checker sends nothing but a GET.
+
+- **Headers**, as key/value rows in the form. The first thing anybody needs (an API key, a tenant
+  id, an `Accept`), and the one that raises the secrets question: a key typed here lands in a
+  Stream Deck profile that travels with an export, which is the same problem import and export has
+  to solve. Solve it once, in the same place.
+- **Method and body**, so a POST-only health route can be checked at all.
+- **Skipping certificate verification**, for the self-signed certificates on internal boxes.
+  Per service, off by default, and *visible* once on — a key that is green without verifying
+  anything is worse than a key that is red. Node's `fetch` has no per-request way to relax TLS:
+  the global switch would disable verification for every check in the process, so this means
+  either a separate `https` path for those services or taking on `undici` for a per-request
+  dispatcher. That dependency decision is the real cost of the checkbox.
+
+## Checks that expect a failure
+
+Verifying that something is *not* reachable, or not permitted: a firewall rule that should be
+blocking, an admin route that must refuse anonymous callers, a decommissioned endpoint that should
+stay gone.
+
+Most of this already works and is only badly advertised — setting **Expected status** to 401 or 404
+does exactly this today. What is missing is the case with no response at all, since a transport
+error is unconditionally a failure right now. That is one inversion flag, and it sits naturally
+beside the TCP check type: "this port should be closed from here". A negative body match — this
+page must *not* contain `Exception` — is the same idea and about as small.
+
+The thing to settle first is language, not code. Once a check can invert, "down" no longer means
+down; the model is already "did this match what I expected", but the key's colours and the window's
+wording still say up and down.
 
 ## Windows
 
