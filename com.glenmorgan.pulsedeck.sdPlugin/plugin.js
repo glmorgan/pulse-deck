@@ -10894,6 +10894,8 @@ function renderBoardHtml(overview, token, options = {}) {
   .head .sub {
     font-size: 12px; color: var(--fg-dim); margin-top: 2px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    /* Selectable so a URL can be copied out of it, as it is on the history window's own header. */
+    -webkit-user-select: text; user-select: text;
   }
   button.primary {
     font: inherit; font-size: 12px; font-weight: 600; color: var(--bg);
@@ -11502,8 +11504,13 @@ function renderBoardHtml(overview, token, options = {}) {
     var title = document.getElementById('title');
     title.textContent = service.name;
     title.title = service.name;
-    document.getElementById('subtitle').textContent =
-      service.stateLabel + ' · ' + agoOf(service.lastCheckedAt);
+    // The endpoint belongs in the header, as it is on a Health Check key: the name is whatever
+    // someone typed, and the URL is the thing actually being checked.
+    var subtitle = document.getElementById('subtitle');
+    subtitle.textContent = service.stateLabel
+      + ' · ' + (service.url || 'No URL configured')
+      + ' · checked ' + agoOf(service.lastCheckedAt);
+    subtitle.title = service.url;
     document.getElementById('edit').hidden = false;
 
     var detail = document.getElementById('detail');
