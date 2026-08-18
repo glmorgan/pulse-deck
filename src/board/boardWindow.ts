@@ -97,6 +97,19 @@ function escapeHtml(text: string): string {
     .replace(/'/g, "&#39;");
 }
 
+/** Lucide `copy`, ISC. Two pages, one behind the other. */
+const COPY_SVG =
+  `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"`
+  + ` stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+  + `<rect x="8" y="8" width="14" height="14" rx="2"/>`
+  + `<path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>`;
+
+/** Feather `edit-2`, MIT. A pencil, drawn as one stroke so it holds up small. */
+const PENCIL_SVG =
+  `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"`
+  + ` stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+  + `<path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>`;
+
 /** Lucide `refresh-cw`, ISC — the same mark the history window's Check now button carries. */
 const REFRESH_SVG =
   `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"`
@@ -280,6 +293,34 @@ export function renderBoardHtml(
   button.primary:hover:not(:disabled) { filter: brightness(1.08); }
   button.primary:disabled { background: var(--card-line); color: var(--fg-faint); cursor: default; }
   button.primary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* Secondary header controls: an icon in a square, quiet until hovered. */
+  .iconbtn {
+    flex: 0 0 auto; width: 28px; height: 28px; padding: 0;
+    display: inline-grid; place-items: center;
+    color: var(--fg-dim); background: transparent;
+    border: 1px solid var(--card-line); border-radius: 7px; cursor: pointer;
+  }
+  /* Any display rule outranks the browser's [hidden], so hiding one needs saying explicitly. */
+  .iconbtn[hidden] { display: none; }
+  .iconbtn:hover:not(:disabled) { background: var(--kbd); color: var(--fg); }
+  .iconbtn:disabled { opacity: .4; cursor: default; }
+  .iconbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /*
+   * Their own tooltip rather than the title attribute, which the native host does not surface.
+   * An icon with no label has to be able to say what it is.
+   */
+  .iconbtn { position: relative; }
+  .iconbtn::after {
+    content: attr(data-tip);
+    position: absolute; top: calc(100% + 6px); right: 0; z-index: 5;
+    padding: 4px 7px; border-radius: 6px;
+    background: var(--bg); color: var(--fg-dim);
+    border: 1px solid var(--card-line); box-shadow: var(--shadow-lift);
+    font-size: 11px; white-space: nowrap;
+    opacity: 0; pointer-events: none; transition: opacity .1s ease;
+  }
+  .iconbtn:hover::after, .iconbtn:focus-visible::after { opacity: 1; }
+
   button.primary:disabled svg { animation: spin .9s linear infinite; transform-origin: 50% 50%; }
   @keyframes spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { button.primary:disabled svg { animation: none; } }
@@ -583,7 +624,10 @@ export function renderBoardHtml(
       <h1 id="title"></h1>
       <div class="sub" id="subtitle"></div>
     </div>
-    <button type="button" class="ghost" id="edit" hidden>Edit</button>
+    <button type="button" class="iconbtn" id="duplicate" hidden
+      aria-label="Duplicate service" data-tip="Duplicate">${COPY_SVG}</button>
+    <button type="button" class="iconbtn" id="edit" hidden
+      aria-label="Edit service" data-tip="Edit">${PENCIL_SVG}</button>
     <button type="button" class="primary" id="check">${REFRESH_SVG}<span id="check-label">Check all</span></button>
   </div>
   <div id="detail" class="grid"></div>
@@ -602,6 +646,14 @@ export function renderBoardHtml(
   var data = ${embedJson(overview)};
   /** null means the All view; otherwise the id of the selected service. */
   var selected = null;
+  /**
+   * A service's settings, waiting to fill the add form. Set by Duplicate, cleared once used.
+   *
+   * Duplicating opens the form rather than adding a copy outright: the copy would share the
+   * original's URL, so it would be checked immediately against an endpoint already covered, and
+   * changing that URL is the first thing anybody does anyway.
+   */
+  var formSeed = null;
   /** 'list' shows the selection; the others are the forms, which sit over it. */
   var view = 'list';
 
@@ -818,6 +870,7 @@ export function renderBoardHtml(
 
   function paintAll() {
     document.getElementById('edit').hidden = true;
+    document.getElementById('duplicate').hidden = true;
     var detail = document.getElementById('detail');
     detail.className = 'grid';
     detail.textContent = '';
@@ -945,6 +998,11 @@ export function renderBoardHtml(
       + ' · checked ' + agoOf(service.lastCheckedAt);
     subtitle.title = service.url;
     document.getElementById('edit').hidden = false;
+    // Nothing to duplicate into on a full board.
+    var dup = document.getElementById('duplicate');
+    dup.hidden = false;
+    dup.disabled = data.total >= data.capacity;
+    dup.setAttribute('data-tip', dup.disabled ? 'Board is full' : 'Duplicate');
 
     var detail = document.getElementById('detail');
     detail.className = 'frame';
@@ -1162,13 +1220,19 @@ export function renderBoardHtml(
    */
   function paintForm(id) {
     var editing = !!id;
-    var config = editing ? configById(id) : null;
+    var config = editing ? configById(id) : (formSeed || null);
     if (editing && !config) return select(null);
+    // Used once: coming back to a blank Add form afterwards must not resurrect it.
+    formSeed = null;
 
-    document.getElementById('title').textContent = editing ? 'Edit service' : 'Add service';
+    var copying = !editing && !!config;
+    document.getElementById('title').textContent = editing ? 'Edit service'
+      : copying ? 'Duplicate service' : 'Add service';
     document.getElementById('subtitle').textContent = editing
       ? 'Changes take effect on the next check, which runs as soon as you save.'
-      : 'It is checked as soon as you add it.';
+      : copying
+        ? 'Everything is copied. Change what you need, then add it.'
+        : 'It is checked as soon as you add it.';
     document.getElementById('check').hidden = true;
 
     var detail = document.getElementById('detail');
@@ -1442,6 +1506,7 @@ export function renderBoardHtml(
     paintRail();
     paintNotice();
     document.getElementById('edit').hidden = true;
+    document.getElementById('duplicate').hidden = true;
     paintDetail();
     // One button, two jobs: it checks whatever is on screen, which is the whole board on All and
     // one service otherwise.
@@ -1552,6 +1617,13 @@ export function renderBoardHtml(
 
   document.getElementById('check').addEventListener('click', runCheck);
   document.getElementById('edit').addEventListener('click', function () { show('edit'); });
+  document.getElementById('duplicate').addEventListener('click', function () {
+    var config = configById(selected);
+    if (!config || data.total >= data.capacity) return;
+    formSeed = JSON.parse(JSON.stringify(config));
+    formSeed.name = config.name + ' copy';
+    show('add');
+  });
   document.getElementById('add').addEventListener('click', function () {
     if (data.total >= data.capacity) return;
     show('add');
