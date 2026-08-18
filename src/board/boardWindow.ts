@@ -609,6 +609,27 @@ export function renderBoardHtml(
     post('error', { message: String(e.message) + ' @' + e.lineno + ':' + e.colno });
   });
 
+  /**
+   * Anything a control does, with failures shown rather than swallowed.
+   *
+   * A handler that throws leaves a button that visibly does nothing: the click is over, no
+   * message is sent, and the only trace is a line in the plugin's log. That is exactly how a
+   * broken Save looked from the outside. The message goes to the form's error line if it has one,
+   * and to the log either way.
+   */
+  function guard(where, fn) {
+    return function (e) {
+      try {
+        fn(e);
+      } catch (err) {
+        var text = 'Something went wrong: ' + (err && err.message ? err.message : String(err));
+        var slot = document.querySelector('.error');
+        if (slot) slot.textContent = text;
+        post('error', { message: where + ': ' + (err && err.message ? err.message : String(err)) });
+      }
+    };
+  }
+
   function post(type, extra) {
     var body = { type: type };
     if (extra) for (var k in extra) body[k] = extra[k];
@@ -1248,7 +1269,7 @@ export function renderBoardHtml(
 
     cancel.addEventListener('click', function () { select(editing ? id : null); });
 
-    save.addEventListener('click', function () {
+    save.addEventListener('click', guard('save service', function () {
       var value = url.input.value.trim();
       if (!value) return fail('A URL is required.');
       // Deliberately string comparison rather than a regex: this page is a template literal, and
@@ -1287,7 +1308,7 @@ export function renderBoardHtml(
         error.textContent = message;
         return false;
       }
-    });
+    }));
 
     function fail(message) {
       error.textContent = message;
@@ -1357,6 +1378,10 @@ export function renderBoardHtml(
     detail.appendChild(body.wrap);
     detail.appendChild(snippet.wrap);
 
+    var headers = headerField('Headers', d.headers,
+      'Sent with every service unless it sets its own');
+    detail.appendChild(headers.wrap);
+
     var error = el('div', 'error');
     var actions = el('div', 'form-actions');
     var save = el('button', 'primary', 'Save settings');
@@ -1369,7 +1394,7 @@ export function renderBoardHtml(
     detail.appendChild(error);
 
     cancel.addEventListener('click', function () { select(null); });
-    save.addEventListener('click', function () {
+    save.addEventListener('click', guard('save board settings', function () {
       var update = {
         boardName: name.input.value.trim(),
         defaults: {
@@ -1401,7 +1426,7 @@ export function renderBoardHtml(
         apply(reply.data);
         select(null);
       });
-    });
+    }));
   }
 
   function paintDetail() {
