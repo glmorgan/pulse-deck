@@ -1,6 +1,6 @@
 {
   "name": "com.glenmorgan.pulsedeck",
-  "version": "2.0.0-alpha.4",
+  "version": "2.0.0-alpha.5",
   "description": "PulseDeck – Monitor HTTP health check endpoints from your Stream Deck",
   "private": true,
   "scripts": {
