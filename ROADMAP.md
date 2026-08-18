@@ -83,19 +83,20 @@ standing between the alpha and a release anyone else can install.
 
 ## More control over the request
 
-Real health endpoints often want more than a URL, and the checker sends nothing but a GET.
+Headers landed in 2.0. What is left:
 
-- **Headers**, as key/value rows in the form. The first thing anybody needs (an API key, a tenant
-  id, an `Accept`), and the one that raises the secrets question: a key typed here lands in a
-  Stream Deck profile that travels with an export, which is the same problem import and export has
-  to solve. Solve it once, in the same place.
-- **Method and body**, so a POST-only health route can be checked at all.
 - **Skipping certificate verification**, for the self-signed certificates on internal boxes.
   Per service, off by default, and *visible* once on — a key that is green without verifying
   anything is worse than a key that is red. Node's `fetch` has no per-request way to relax TLS:
   the global switch would disable verification for every check in the process, so this means
   either a separate `https` path for those services or taking on `undici` for a per-request
-  dispatcher. That dependency decision is the real cost of the checkbox.
+  dispatcher. That dependency decision is the real cost of the checkbox, and it is the next thing
+  to settle.
+- **Method and body**, so a POST-only health route can be checked at all. A body opens up PUT and
+  POST, which is worth having but is a bigger form and its own validation.
+
+Headers are stored as ordinary settings, not secrets, so import and export inherits that decision
+rather than making it.
 
 ## Checks that expect a failure
 
@@ -125,3 +126,16 @@ second host.
 Latency, status codes, hangs and flapping on demand, so the board can be tested against
 misbehaviour without waiting for production to misbehave. Belongs in its own repository rather
 than this one.
+
+## Landed since the alpha
+
+Kept short; `git log v2.0.0-alpha.1..main` has the detail.
+
+- Request headers, on the board and per service, with the board's set inherited unless a service
+  replaces it
+- Checks scheduled from the last check rather than from when the key appeared, so opening a folder
+  no longer re-runs a board
+- A short press opens the window and a hold checks, on both actions
+- The board's inspector reduced to one button, with everything configured in the window
+- One healthy green across the key, the pill, the chart and the sparklines
+- The endpoint shown in the board's service header
