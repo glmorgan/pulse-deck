@@ -98,6 +98,18 @@ Headers landed in 2.0. What is left:
 Headers are stored as ordinary settings, not secrets, so import and export inherits that decision
 rather than making it.
 
+## Let a service send no headers at all
+
+The model has three states — inherit the board's, use my own set, send none — and the form can
+only express two. Clearing every row is read as "no override", so the board's headers come back;
+there is no way to say a particular service sends nothing.
+
+`null` already means inherit and `[]` already means none, so this is a form problem, not a data
+one. The fix is to stop inferring intent from emptiness: a "use the board's headers" checkbox,
+ticked by default, and unticking it reveals the rows prefilled with a copy of the board's — so the
+common case, the board's set minus one, is deleting a row rather than retyping four. The service
+view should then say which of the three a service is on.
+
 ## Checks that expect a failure
 
 Verifying that something is *not* reachable, or not permitted: a firewall rule that should be
