@@ -1,4 +1,4 @@
-import type { HealthCheckSettings } from "../types.js";
+import type { HeaderPair, HealthCheckSettings } from "../types.js";
 import type { CheckResult } from "./stateEvaluator.js";
 
 const MAX_BODY_SNIPPET = 500;
@@ -24,6 +24,29 @@ export function describeFetchError(err: unknown): string {
   return err.message === "fetch failed" ? detail : `${err.message}: ${detail}`;
 }
 
+/**
+ * Turns configured header rows into something `fetch` will accept.
+ *
+ * Rows are dropped rather than repaired when they cannot be sent: an empty name is a row someone
+ * started and abandoned, and a name carrying a colon, whitespace or a newline would either be
+ * rejected by fetch or, in the newline case, be an attempt to inject a second header. A single bad
+ * row must not fail the whole check, because the state it produces would say the *service* is
+ * down.
+ */
+export function buildHeaders(headers: HeaderPair[] | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const header of headers ?? []) {
+    const name = String(header?.name ?? "").trim();
+    const value = String(header?.value ?? "").trim();
+    if (!name) continue;
+    if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(name)) continue;
+    if (/[\r\n]/.test(value)) continue;
+    // Last one wins, which is what a form's later row visually implies.
+    out[name] = value;
+  }
+  return out;
+}
+
 export async function runHealthCheck(
   settings: HealthCheckSettings
 ): Promise<CheckResult> {
@@ -38,6 +61,7 @@ export async function runHealthCheck(
   try {
     const response = await fetch(settings.endpointUrl.trim(), {
       method: "GET",
+      headers: buildHeaders(settings.headers),
       signal: controller.signal,
     });
 

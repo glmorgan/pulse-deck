@@ -1,6 +1,6 @@
 import type { JsonValue } from "@elgato/utils";
 
-import type { ButtonState, CheckFrequency, CheckRecord } from "../types.js";
+import type { ButtonState, CheckFrequency, CheckRecord, HeaderPair } from "../types.js";
 
 /**
  * A board of services on one key.
@@ -31,6 +31,15 @@ export interface ServiceConfig {
   recoverAfterSuccesses: number | null;
   expectedBodyContains: string | null;
   showBodySnippetInHistory: boolean | null;
+  /**
+   * Replaces the board's headers rather than adding to them.
+   *
+   * Merging would be a third meaning for a field — inherit, override, or combine — and the moment
+   * one field behaves differently from the others the model stops being predictable. A service
+   * that needs the board's headers plus one of its own repeats them; twelve services needing the
+   * same header put it on the board.
+   */
+  headers: HeaderPair[] | null;
 }
 
 /** What checking a service produces. One of these per service, keyed by service id. */
@@ -59,6 +68,8 @@ export interface BoardDefaults {
   recoverAfterSuccesses: number;
   expectedBodyContains: string;
   showBodySnippetInHistory: boolean;
+  /** Sent with every service's request unless that service overrides them. */
+  headers: HeaderPair[];
 }
 
 export interface BoardSettings {
@@ -82,6 +93,7 @@ export const DEFAULT_BOARD_DEFAULTS: BoardDefaults = {
   recoverAfterSuccesses: 1,
   expectedBodyContains: "",
   showBodySnippetInHistory: false,
+  headers: [],
 };
 
 export const DEFAULT_BOARD_SETTINGS: BoardSettings = {

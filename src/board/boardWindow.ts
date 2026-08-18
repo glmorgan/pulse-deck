@@ -421,9 +421,16 @@ export function renderBoardHtml(
    * and "board: 1" made Amber after wide. Every input in a form was a different length, for a
    * reason that had nothing to do with what goes in it. A fixed hint column ends that.
    */
+  /*
+   * Two columns, not three.
+   *
+   * The third column existed to hold hints beside the inputs, which cost every field 196px of
+   * width to carry a few words on two of them. The hints that survive sit under their input
+   * instead, so a field is as wide as the form and the labels still line up.
+   */
   .field {
-    display: grid; grid-template-columns: 132px minmax(0, 1fr) 196px;
-    align-items: center; gap: 12px; margin-bottom: 9px;
+    display: grid; grid-template-columns: 132px minmax(0, 1fr);
+    align-items: center; gap: 4px 12px; margin-bottom: 11px;
   }
   .field label { font-size: 12px; color: var(--fg-dim); text-align: right; }
   .field input[type="text"], .field select {
@@ -432,12 +439,42 @@ export function renderBoardHtml(
     padding: 6px 9px; outline: none;
   }
   .field input:focus, .field select:focus { border-color: var(--accent); }
-  .field .hint { font-size: 11px; color: var(--fg-faint); }
+  /* Under the input it describes, in the input's column — never beside it. */
+  .field .hint { grid-column: 2; font-size: 11px; color: var(--fg-faint); }
   /* The checkbox row keeps the old flex, because its hint is a sentence that belongs beside the
      box rather than in the narrow column the other hints share. */
   .field.check { display: flex; align-items: center; gap: 12px; }
   .field.check label { flex: 0 0 132px; }
   .field.check input { margin: 0; }
+
+  /*
+   * Header rows: name, value and remove on one line.
+   *
+   * The body spans the input column and the hint column, because a token is long and the hint
+   * column is dead space here. Each input needs width:auto to undo the form's width:100%, which
+   * would otherwise make both of them want the whole row and stack them.
+   */
+  .field.headers { align-items: start; }
+  .field.headers label { padding-top: 7px; }
+  .headers-body { grid-column: 2; min-width: 0; }
+  .header-rows { display: flex; flex-direction: column; gap: 6px; }
+  .header-row { display: flex; align-items: center; gap: 6px; }
+  .header-row input[type="text"] { width: auto; flex: 1 1 auto; }
+  /* The name is the shorter of the two: a value holds the token. */
+  .header-row input.h-name { flex: 0 0 32%; }
+  .h-remove {
+    flex: 0 0 auto; width: 28px; height: 28px; padding: 0;
+    font: inherit; font-size: 15px; line-height: 1; color: var(--fg-faint);
+    background: transparent; border: 1px solid var(--card-line); border-radius: 7px;
+    cursor: pointer;
+  }
+  .h-remove:hover { color: var(--fail); background: var(--kbd); }
+  .h-add {
+    font: inherit; font-size: 11.5px; color: var(--fg-dim); background: transparent;
+    border: 0; padding: 7px 0 0; cursor: pointer;
+  }
+  .h-add:hover { color: var(--fg); text-decoration: underline; }
+  .h-note { font-size: 11px; color: var(--fg-faint); padding-top: 5px; }
 
   /*
    * The numbers go in a grid of their own.
@@ -458,7 +495,7 @@ export function renderBoardHtml(
    * makes both edges follow the form instead of being guessed at.
    */
   .numrow {
-    display: grid; grid-template-columns: 132px minmax(0, 1fr) 196px;
+    display: grid; grid-template-columns: 132px minmax(0, 1fr);
     gap: 12px; margin-bottom: 4px;
   }
   .numgrid {
@@ -470,14 +507,15 @@ export function renderBoardHtml(
   .numgrid .field input[type="text"] { width: 100%; }
   .numgrid .field .hint { display: block; margin-top: 4px; }
   details { margin: 14px 0 4px; }
+  /* 144px, not 132: the label column plus its gap, so the disclosure starts where inputs do. */
   summary {
     cursor: pointer; font-size: 12px; color: var(--fg-dim); margin-bottom: 10px;
-    padding-left: 132px;
+    padding-left: 144px;
   }
   summary:hover { color: var(--fg); }
   .form-actions {
     display: flex; align-items: center; gap: 8px; margin: 16px 0 4px;
-    padding-left: 144px; padding-right: 208px;
+    padding-left: 144px;
   }
   /* Delete sits away from Cancel. Adjacent, the destructive button is one slip from the one you
      press to back out, and they are the two you reach for in the same frame of mind. */
@@ -963,11 +1001,28 @@ export function renderBoardHtml(
     expectedBodyContains: 'Text the response body must contain. Blank skips the body check.'
   };
 
+  /**
+   * A text input with every macOS text convenience turned off.
+   *
+   * These fields hold URLs, header names and strings to match a response body against — none of
+   * which are prose. Typing "healthy" into Body contains and having it corrected to "Healthy"
+   * produces a check that silently never matches, and the same goes for smart quotes in a header
+   * value. Nothing here should ever be helpfully rewritten.
+   */
+  function plainInput() {
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.setAttribute('autocapitalize', 'none');
+    input.setAttribute('autocorrect', 'off');
+    input.setAttribute('autocomplete', 'off');
+    input.spellcheck = false;
+    return input;
+  }
+
   function field(label, hint) {
     var wrap = el('div', 'field');
     wrap.appendChild(el('label', null, label));
-    var input = document.createElement('input');
-    input.type = 'text';
+    var input = plainInput();
     wrap.appendChild(input);
     if (hint) wrap.appendChild(el('span', 'hint', hint));
     return { wrap: wrap, input: input };
@@ -997,6 +1052,69 @@ export function renderBoardHtml(
     wrap.appendChild(input);
     wrap.appendChild(el('span', 'hint', text));
     return { wrap: wrap, input: input };
+  }
+
+  /**
+   * A repeatable name/value list, for request headers.
+   *
+   * Reading it back returns only rows that have a name, so a blank row left at the bottom is
+   * simply not saved — which is what makes "add a row, then change your mind" cost nothing.
+   */
+  function headerField(label, headers, inheritedNote) {
+    var wrap = el('div', 'field headers');
+    wrap.appendChild(el('label', null, label));
+
+    var body = el('div', 'headers-body');
+    var rows = el('div', 'header-rows');
+    body.appendChild(rows);
+
+    function addRow(name, value) {
+      var row = el('div', 'header-row');
+      var nameInput = plainInput();
+      nameInput.placeholder = 'Name';
+      nameInput.className = 'h-name';
+      nameInput.value = name || '';
+      var valueInput = plainInput();
+      valueInput.placeholder = 'Value';
+      valueInput.value = value || '';
+      var remove = el('button', 'h-remove', '\\u00d7');
+      remove.type = 'button';
+      remove.title = 'Remove this header';
+      remove.addEventListener('click', function () { rows.removeChild(row); });
+      row.appendChild(nameInput);
+      row.appendChild(valueInput);
+      row.appendChild(remove);
+      rows.appendChild(row);
+      return row;
+    }
+
+    (headers || []).forEach(function (header) { addRow(header.name, header.value); });
+
+    var add = el('button', 'h-add', 'Add header');
+    add.type = 'button';
+    add.addEventListener('click', function () {
+      var row = addRow('', '');
+      row.querySelector('input').focus();
+    });
+    body.appendChild(add);
+    if (inheritedNote) body.appendChild(el('div', 'h-note', inheritedNote));
+    wrap.appendChild(body);
+
+    return {
+      wrap: wrap,
+      read: function () {
+        var out = [];
+        var all = rows.querySelectorAll('.header-row');
+        for (var i = 0; i < all.length; i++) {
+          var inputs = all[i].querySelectorAll('input');
+          var name = inputs[0].value.trim();
+          if (!name) continue;
+          out.push({ name: name, value: inputs[1].value.trim() });
+        }
+        return out;
+      },
+      touched: function () { return rows.querySelectorAll('.header-row').length > 0; }
+    };
   }
 
   /** Blank means inherit, so an override reads as a number or as nothing at all. */
@@ -1036,7 +1154,7 @@ export function renderBoardHtml(
     detail.className = 'form';
     detail.textContent = '';
 
-    var name = field('Name', 'shown on the card and in the list');
+    var name = field('Name');
     name.input.value = config ? config.name : '';
     name.input.placeholder = 'Optional — defaults to the host';
     var url = field('URL');
@@ -1094,6 +1212,16 @@ export function renderBoardHtml(
       config && config.showBodySnippetInHistory !== null
         ? config.showBodySnippetInHistory : d.showBodySnippetInHistory);
     advanced.appendChild(snippet.wrap);
+
+    // Overriding headers replaces the board's rather than adding to them, so the note says what
+    // the board sends and leaving the list empty inherits it.
+    var inherited = d.headers.length
+      ? 'Empty inherits the board\u2019s ' + d.headers.length
+        + (d.headers.length === 1 ? ' header' : ' headers')
+      : 'The board sends none';
+    var headers = headerField('Headers',
+      config && config.headers ? config.headers : [], inherited);
+    advanced.appendChild(headers.wrap);
     detail.appendChild(advanced);
 
     var error = el('div', 'error');
@@ -1141,7 +1269,9 @@ export function renderBoardHtml(
         redAfterFailures: overrideValue(red.input.value),
         recoverAfterSuccesses: overrideValue(recover.input.value),
         expectedBodyContains: body.input.value.trim() === '' ? null : body.input.value,
-        showBodySnippetInHistory: snippet.input.checked
+        showBodySnippetInHistory: snippet.input.checked,
+        // No rows means inherit; rows mean this service's own set.
+        headers: headers.read().length ? headers.read() : null
       };
 
       save.disabled = true;
@@ -1252,7 +1382,8 @@ export function renderBoardHtml(
           recoverAfterSuccesses:
             overrideValue(recover.input.value) || d.recoverAfterSuccesses,
           expectedBodyContains: body.input.value,
-          showBodySnippetInHistory: snippet.input.checked
+          showBodySnippetInHistory: snippet.input.checked,
+          headers: headers.read()
         }
       };
       if (update.defaults.redAfterFailures < update.defaults.amberAfterFailures) {

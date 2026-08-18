@@ -34,6 +34,7 @@ export function newService(name: string, url: string): ServiceConfig {
     recoverAfterSuccesses: null,
     expectedBodyContains: null,
     showBodySnippetInHistory: null,
+    headers: null,
   };
 }
 
@@ -73,6 +74,7 @@ export function resolveService(
       inherit(service.recoverAfterSuccesses, defaults.recoverAfterSuccesses),
       DEFAULT_BOARD_DEFAULTS.recoverAfterSuccesses),
     expectedBodyContains: inherit(service.expectedBodyContains, defaults.expectedBodyContains),
+    headers: inherit(service.headers, defaults.headers) ?? [],
     showBodySnippetInHistory:
       inherit(service.showBodySnippetInHistory, defaults.showBodySnippetInHistory),
     history: runtime.history ?? [],

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { describeFetchError } from "./healthChecker.js";
+import { buildHeaders, describeFetchError } from "./healthChecker.js";
 
 /**
  * Node's fetch reports every transport failure as `TypeError: fetch failed`, with the real reason
@@ -38,5 +38,52 @@ describe("describeFetchError", () => {
   it("never returns empty for something that is not an Error at all", () => {
     expect(describeFetchError("boom")).toBe("Unknown error");
     expect(describeFetchError(undefined)).toBe("Unknown error");
+  });
+});
+
+// ── buildHeaders ───────────────────────────────────────────────────────────
+
+describe("buildHeaders", () => {
+  it("sends what was configured", () => {
+    expect(buildHeaders([{ name: "X-Api-Key", value: "abc123" }]))
+      .toEqual({ "X-Api-Key": "abc123" });
+  });
+
+  it("has nothing to send when nothing is configured", () => {
+    expect(buildHeaders([])).toEqual({});
+    expect(buildHeaders(undefined)).toEqual({});
+  });
+
+  it("drops a row with no name, which is one someone started and left", () => {
+    expect(buildHeaders([{ name: "  ", value: "x" }])).toEqual({});
+  });
+
+  it("keeps a header with an empty value, which is a real thing to send", () => {
+    expect(buildHeaders([{ name: "X-Debug", value: "" }])).toEqual({ "X-Debug": "" });
+  });
+
+  it("trims the whitespace around what was typed", () => {
+    expect(buildHeaders([{ name: " Accept ", value: " application/json " }]))
+      .toEqual({ Accept: "application/json" });
+  });
+
+  it("refuses a name fetch would reject rather than failing the whole check", () => {
+    // A bad row must not throw: the state that produced would say the *service* is down.
+    expect(buildHeaders([
+      { name: "Bad Name", value: "x" },
+      { name: "Also:Bad", value: "x" },
+      { name: "Good", value: "y" },
+    ])).toEqual({ Good: "y" });
+  });
+
+  it("refuses a value carrying a newline, which is header injection", () => {
+    expect(buildHeaders([{ name: "X-Test", value: "a\r\nX-Evil: b" }])).toEqual({});
+  });
+
+  it("lets the later row win, as its position implies", () => {
+    expect(buildHeaders([
+      { name: "Accept", value: "text/plain" },
+      { name: "Accept", value: "application/json" },
+    ])).toEqual({ Accept: "application/json" });
   });
 });

@@ -23,6 +23,16 @@ export interface CheckRecord {
   error: string | null;
 }
 
+/**
+ * One request header. A list rather than an object so the form can keep the order they were typed
+ * in, and so a half-filled row on its way to being completed is representable.
+ */
+export interface HeaderPair {
+  [key: string]: JsonValue;
+  name: string;
+  value: string;
+}
+
 export interface HealthCheckSettings {
   [key: string]: JsonValue;
   serviceName: string;
@@ -37,6 +47,8 @@ export interface HealthCheckSettings {
   recoverAfterSuccesses: number;
   expectedBodyContains: string;
   showBodySnippetInHistory: boolean;
+  /** Sent with every request. Ordinary settings, not secrets — they travel with a profile. */
+  headers: HeaderPair[];
   // Persisted runtime state
   history: CheckRecord[];
   currentState: ButtonState;
@@ -61,6 +73,7 @@ export const DEFAULT_SETTINGS: HealthCheckSettings = {
   recoverAfterSuccesses: 1,
   expectedBodyContains: "",
   showBodySnippetInHistory: false,
+  headers: [],
   history: [],
   currentState: "unknown",
   consecutiveFailures: 0,
