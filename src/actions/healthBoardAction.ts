@@ -276,13 +276,16 @@ export class HealthBoardAction extends SingletonAction<BoardSettings> {
               await this.afterMutation(keyAction, instance);
               return held.service.id;
             },
-            onMoveService: async (serviceId, delta) => {
+            onMoveService: async (serviceId, to) => {
               const services = instance.settings.services;
               const from = services.findIndex((s) => s.id === serviceId);
-              const to = from + delta;
-              if (from < 0 || to < 0 || to >= services.length) return;
+              if (from < 0) return;
+              const target = to.index !== undefined ? to.index : from + (to.delta ?? 0);
+              // Clamped rather than refused: a drop past the end of the list means the end.
+              const clamped = Math.max(0, Math.min(services.length - 1, target));
+              if (clamped === from) return;
               const [moved] = services.splice(from, 1);
-              services.splice(to, 0, moved);
+              services.splice(clamped, 0, moved);
               await this.afterMutation(keyAction, instance);
             },
             onUpdateBoard: async (update) => {

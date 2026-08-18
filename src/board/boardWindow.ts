@@ -49,7 +49,7 @@ export type BoardWindowOptions = {
   onDeleteService?: (id: string) => Promise<void>;
   /** Restores the last deleted service and returns its id, so the window can select it again. */
   onUndoDelete?: () => Promise<string>;
-  onMoveService?: (id: string, delta: number) => Promise<void>;
+  onMoveService?: (id: string, to: { delta?: number; index?: number }) => Promise<void>;
   onUpdateBoard?: (update: BoardUpdate) => Promise<void>;
   onOpen?: (close: () => void) => void;
   onWarn?: (message: string) => void;
@@ -96,6 +96,26 @@ function escapeHtml(text: string): string {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 }
+
+/** Lucide `plus`, ISC. */
+const PLUS_SVG =
+  `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor"`
+  + ` stroke-width="2.4" stroke-linecap="round" aria-hidden="true">`
+  + `<path d="M12 5v14M5 12h14"/></svg>`;
+
+/** Lucide `sliders-horizontal`, ISC. Settings that are values rather than a machine. */
+const SLIDERS_SVG =
+  `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor"`
+  + ` stroke-width="2" stroke-linecap="round" aria-hidden="true">`
+  + `<path d="M4 7h10M18 7h2M4 17h4M12 17h8"/>`
+  + `<circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>`;
+
+/** A grip: six dots, the conventional mark for a row that can be dragged. */
+const GRIP_SVG =
+  `<svg viewBox="0 0 10 16" width="10" height="16" fill="currentColor" aria-hidden="true">`
+  + `<circle cx="3" cy="4" r="1.2"/><circle cx="7" cy="4" r="1.2"/>`
+  + `<circle cx="3" cy="8" r="1.2"/><circle cx="7" cy="8" r="1.2"/>`
+  + `<circle cx="3" cy="12" r="1.2"/><circle cx="7" cy="12" r="1.2"/></svg>`;
 
 /** Lucide `copy`, ISC. Two pages, one behind the other. */
 const COPY_SVG =
@@ -260,6 +280,13 @@ export function renderBoardHtml(
     display: inline-block; flex: none;
     width: 9px; height: 9px; border-radius: 50%; background: var(--fg-faint);
   }
+  /* The dot and the footer icons share a 13px slot, so every label in the rail starts in line. */
+  .row .dot { margin: 0 2px; }
+  .rowicon {
+    flex: 0 0 13px; display: grid; place-items: center; color: var(--fg-faint);
+  }
+  .row:hover .rowicon { color: var(--fg-dim); }
+  .row:disabled .rowicon { opacity: .5; }
   .dot[data-state="healthy"] { background: var(--good); }
   .dot[data-state="slow"] { background: var(--slow); }
   .dot[data-state="warning"] { background: var(--warn); }
@@ -580,21 +607,35 @@ export function renderBoardHtml(
     background: transparent; border: 0; padding: 0; cursor: pointer; text-decoration: underline;
   }
 
+
   /*
-   * Reordering lives on the row, because the row's order is what it changes.
-   *
-   * Hidden with visibility rather than display, so the controls keep their box and the row does
-   * not change size as the pointer crosses it — the label would otherwise reflow and the whole
-   * list would twitch as you moved down it.
+   * The grip appears on hover to say the row can be dragged, which nothing else does now the
+   * arrows are gone. Hidden with visibility rather than display, so its box is always reserved
+   * and the label does not reflow as the pointer crosses the list.
    */
-  .row .moves { display: flex; visibility: hidden; gap: 1px; flex: 0 0 auto; }
-  .row:hover .moves, .row.on .moves { visibility: visible; }
-  .row .moves span {
-    width: 16px; height: 16px; border-radius: 4px; display: grid; place-items: center;
-    color: var(--fg-faint); font-size: 9px;
+  .grip {
+    flex: 0 0 auto; visibility: hidden; display: grid; place-items: center;
+    color: var(--fg-faint); cursor: grab;
   }
-  .row .moves span:hover { background: var(--kbd); color: var(--fg); }
-  .row .moves span.off { opacity: .25; pointer-events: none; }
+  .row:hover .grip, .row:focus-visible .grip, .row.lifted .grip { visibility: visible; }
+  .row.lifted .grip { color: var(--fg-dim); cursor: grabbing; }
+
+  /*
+   * Dragging: the row lifts and follows the pointer, the others slide to open a gap.
+   *
+   * Only the neighbours are animated. A transition on the dragged row would make it lag the
+   * pointer, which reads as the drag being unresponsive rather than as smoothing.
+   */
+  .row { transition: transform 120ms ease; }
+  .row.lifted {
+    transition: none; cursor: grabbing; z-index: 3; position: relative;
+    background: var(--card); box-shadow: var(--shadow-lift);
+  }
+  /* Overrides the lifted row's transition:none for the drop, and only for the drop. */
+  .row.lifted.settling { transition: transform 150ms cubic-bezier(.2, .7, .3, 1); }
+  body.dragging-row, body.dragging-row .row { cursor: grabbing; }
+  /* The list has to allow the lifted row out of its own box while it moves. */
+  .list { overflow-y: auto; overflow-x: visible; }
 
   footer { flex: 0 0 auto; display: flex; align-items: center; gap: 16px; height: 30px; }
   footer span { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--fg-faint); }
@@ -613,8 +654,12 @@ export function renderBoardHtml(
   </div>
   <div class="list" id="list"></div>
   <div class="rail-foot">
-    <button type="button" class="row muted" id="add"><span class="label">Add service</span></button>
-    <button type="button" class="row muted" id="settings"><span class="label">Board settings</span></button>
+    <button type="button" class="row muted" id="add">
+      <span class="rowicon">${PLUS_SVG}</span><span class="label">Add service</span>
+    </button>
+    <button type="button" class="row muted" id="settings">
+      <span class="rowicon">${SLIDERS_SVG}</span><span class="label">Board settings</span>
+    </button>
   </div>
 </nav>
 
@@ -776,16 +821,36 @@ export function renderBoardHtml(
         label.title = service.name;
         row.appendChild(label);
 
-        /*
-         * Up and down live on the row because the row's position is what they change, and that
-         * position is the cell the service occupies on the key — top-left is the first row.
-         */
-        var moves = el('span', 'moves');
-        moves.appendChild(moveControl('\u25B2', service.id, -1, index === 0));
-        moves.appendChild(moveControl('\u25BC', service.id, 1, index === data.services.length - 1));
-        row.appendChild(moves);
+        // A drag ends in a pointerup that the browser follows with a click. Selecting there
+        // would open whatever was just rearranged, which is not what the gesture asked for.
+        row.addEventListener('click', function () {
+          if (dragSuppressedClick) { dragSuppressedClick = false; return; }
+          select(service.id);
+        });
+        var grip = el('span', 'grip');
+        grip.innerHTML = ${embedJson(GRIP_SVG)};
+        row.appendChild(grip);
 
-        row.addEventListener('click', function () { select(service.id); });
+        row.setAttribute('data-id', service.id);
+        row.setAttribute('data-index', String(index));
+        row.addEventListener('pointerdown', function (e) { beginDrag(e, row, service.id, index); });
+        /*
+         * Alt with an arrow moves the focused row, which is the whole keyboard route now that the
+         * up and down controls are gone. Alt because the bare arrows belong to the list itself.
+         */
+        row.addEventListener('keydown', function (e) {
+          if (!e.altKey || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+          e.preventDefault();
+          var delta = e.key === 'ArrowUp' ? -1 : 1;
+          if (index + delta < 0 || index + delta >= data.services.length) return;
+          post('move-service', { id: service.id, delta: delta }).then(function () {
+            return refresh();
+          }).then(function () {
+            // Follow the row that moved, so a second press keeps moving the same service.
+            var moved = document.querySelector('#list .row[data-id="' + service.id + '"]');
+            if (moved) moved.focus();
+          });
+        });
         list.appendChild(row);
       })(data.services[i], i);
     }
@@ -819,18 +884,149 @@ export function renderBoardHtml(
     document.getElementById('subtitle').textContent = parts.join(' · ');
   }
 
-  function moveControl(glyph, id, delta, disabled) {
-    var control = el('span', disabled ? 'off' : '', glyph);
-    control.setAttribute('role', 'button');
-    control.title = delta < 0 ? 'Move up' : 'Move down';
-    control.addEventListener('click', function (e) {
-      // The row is a button and a click on the control would select it as well.
-      e.stopPropagation();
-      if (disabled) return;
-      post('move-service', { id: id, delta: delta }).then(refresh);
-    });
-    return control;
+  /* ── dragging a row ──────────────────────────────────────────────────── */
+
+  /**
+   * Reordering by dragging, on pointer events rather than the HTML5 drag API.
+   *
+   * The rows are buttons that select a service, so a drag has to be told apart from a click: it
+   * only starts once the pointer has moved a few pixels, and the click that follows the release
+   * is swallowed. Pointer events also keep the drop indicator ours to draw, where the drag API
+   * would insist on a ghost image and its own drop semantics.
+   */
+  var drag = null;
+  var dragSuppressedClick = false;
+  var DRAG_THRESHOLD = 4;
+
+  function beginDrag(e, row, id, index) {
+    // Left button only, and never from the up/down controls, which have their own job.
+    if (e.button !== 0) return;
+    drag = {
+      id: id, from: index, row: row, startY: e.clientY, active: false,
+      pointerId: e.pointerId, target: index
+    };
+    row.setPointerCapture(e.pointerId);
   }
+
+  function rowBoxes() {
+    var rows = document.querySelectorAll('#list .row[data-id]');
+    var boxes = [];
+    for (var i = 0; i < rows.length; i++) boxes.push(rows[i].getBoundingClientRect());
+    return boxes;
+  }
+
+  /**
+   * Where the row would land if dropped here.
+   *
+   * Measured against the midpoints taken when the drag began, never against live rects: the rows
+   * are transformed while dragging, so a live measurement moves as the gap opens and the target
+   * is computed from positions it just caused. That fed back on itself, which is why dragging
+   * downwards fought you and dragging up mostly did not.
+   *
+   * Up and down are asymmetric on purpose. Going up, the row lands above the first row whose
+   * middle the pointer has passed; going down, below the last one. Anything else needs the
+   * pointer to travel a full row past the target before it commits.
+   */
+  function dropIndexAt(y) {
+    var mids = drag.mids;
+    var target = drag.from;
+    for (var i = 0; i < drag.from; i++) {
+      if (y < mids[i]) { target = i; break; }
+    }
+    for (var j = mids.length - 1; j > drag.from; j--) {
+      if (y > mids[j]) { target = j; break; }
+    }
+    return target;
+  }
+
+  /**
+   * The rows move out of the way instead of a line being drawn between them.
+   *
+   * A static list with an insertion marker tells you where the row would go; shifting the others
+   * shows you the list you are about to have. Done with transforms so nothing is laid out again
+   * while the pointer is moving.
+   */
+  function paintGap(target, dy) {
+    var rows = document.querySelectorAll('#list .row[data-id]');
+    if (!rows.length) return;
+    for (var i = 0; i < rows.length; i++) {
+      if (i === drag.from) {
+        rows[i].style.transform = 'translateY(' + dy + 'px)';
+        continue;
+      }
+      var shift = 0;
+      if (target > drag.from && i > drag.from && i <= target) shift = -drag.step;
+      else if (target < drag.from && i >= target && i < drag.from) shift = drag.step;
+      rows[i].style.transform = shift ? 'translateY(' + shift + 'px)' : '';
+    }
+  }
+
+  function clearGap() {
+    var rows = document.querySelectorAll('#list .row[data-id]');
+    for (var i = 0; i < rows.length; i++) {
+      rows[i].style.transform = '';
+      rows[i].classList.remove('lifted');
+    }
+  }
+
+  document.addEventListener('pointermove', function (e) {
+    if (!drag) return;
+    if (!drag.active) {
+      if (Math.abs(e.clientY - drag.startY) < DRAG_THRESHOLD) return;
+      drag.active = true;
+      // Taken before anything is transformed, and kept for the whole drag.
+      var boxes = rowBoxes();
+      drag.mids = boxes.map(function (b) { return b.top + b.height / 2; });
+      // Row height plus the list's gap, measured rather than assumed.
+      drag.step = boxes.length > 1 ? boxes[1].top - boxes[0].top : boxes[0].height;
+      drag.row.classList.add('lifted');
+      document.body.classList.add('dragging-row');
+    }
+    drag.target = dropIndexAt(e.clientY);
+    paintGap(drag.target, e.clientY - drag.startY);
+  });
+
+  document.addEventListener('pointerup', function () {
+    if (!drag) return;
+    var finished = drag;
+    drag = null;
+    document.body.classList.remove('dragging-row');
+
+    if (!finished.active) {
+      clearGap();
+      return;
+    }
+    // The click that follows a release must not select what was just moved.
+    dragSuppressedClick = true;
+
+    /*
+     * The row settles into the gap rather than snapping.
+     *
+     * Letting go used to clear the transforms in the same frame, so the row jumped from under the
+     * pointer to its new position. It now animates the remaining distance, which is the bit of a
+     * drag that tells you it landed, and doubles as the spring back when it is dropped where it
+     * started.
+     */
+    var settled = false;
+    var row = finished.row;
+    function land() {
+      if (settled) return;
+      settled = true;
+      row.removeEventListener('transitionend', land);
+      clearGap();
+      row.classList.remove('settling');
+      if (finished.target === finished.from) return;
+      // One message with the final position, not a delta per step: dragging four places was four
+      // round trips, four writes and four key redraws.
+      post('move-service', { id: finished.id, index: finished.target }).then(refresh);
+    }
+    row.addEventListener('transitionend', land);
+    row.classList.add('settling');
+    row.style.transform =
+      'translateY(' + ((finished.target - finished.from) * finished.step) + 'px)';
+    // A transform that is already at its destination fires no transition, so nothing would land.
+    setTimeout(land, 240);
+  });
 
   /* ── sparkline ───────────────────────────────────────────────────────── */
 
@@ -872,6 +1068,10 @@ export function renderBoardHtml(
     document.getElementById('edit').hidden = true;
     document.getElementById('duplicate').hidden = true;
     var detail = document.getElementById('detail');
+    // Where each card is now, so the rebuilt ones can be animated from there to wherever they end
+    // up. Reordering otherwise repaints the grid in place and the change goes unseen, which is
+    // the one view where the arrangement is the point.
+    var wasAt = cardPositions();
     detail.className = 'grid';
     detail.textContent = '';
 
@@ -927,6 +1127,7 @@ export function renderBoardHtml(
         card.appendChild(figure);
 
         card.setAttribute('data-state', service.state);
+        card.setAttribute('data-id', service.id);
 
         /*
          * The meta line says only what deviates.
@@ -980,6 +1181,50 @@ export function renderBoardHtml(
         card.addEventListener('click', function () { select(service.id); });
         detail.appendChild(card);
       })(data.services[i]);
+    }
+
+    slideCardsFrom(wasAt);
+  }
+
+  /** Every card's current position, by service id. */
+  function cardPositions() {
+    var out = {};
+    var cards = document.querySelectorAll('#detail .cardbtn[data-id]');
+    for (var i = 0; i < cards.length; i++) {
+      out[cards[i].getAttribute('data-id')] = cards[i].getBoundingClientRect();
+    }
+    return out;
+  }
+
+  /**
+   * Moves each card from where it used to be to where it is now.
+   *
+   * The card is placed back at its old offset with no transition, then released on the next
+   * frame, so the browser animates the difference. Nothing is laid out twice: the grid is already
+   * final, and only transforms move.
+   */
+  function slideCardsFrom(wasAt) {
+    if (!wasAt) return;
+    var cards = document.querySelectorAll('#detail .cardbtn[data-id]');
+    for (var i = 0; i < cards.length; i++) {
+      (function (card) {
+        var was = wasAt[card.getAttribute('data-id')];
+        if (!was) return;
+        var now = card.getBoundingClientRect();
+        var dx = was.left - now.left;
+        var dy = was.top - now.top;
+        if (!dx && !dy) return;
+        card.style.transition = 'none';
+        card.style.transform = 'translate(' + dx + 'px, ' + dy + 'px)';
+        requestAnimationFrame(function () {
+          card.style.transition = 'transform 220ms cubic-bezier(.2, .7, .3, 1)';
+          card.style.transform = '';
+          card.addEventListener('transitionend', function done() {
+            card.removeEventListener('transitionend', done);
+            card.style.transition = '';
+          });
+        });
+      })(cards[i]);
     }
   }
 
@@ -1592,6 +1837,8 @@ export function renderBoardHtml(
       paintNotice();
       return;
     }
+    // Rebuilding the rows underneath a drag would drop it. The next poll picks the change up.
+    if (drag) return;
     paint();
   }
 
@@ -1755,11 +2002,21 @@ export async function showBoardWindow(
         return { data: options.getOverview(), id };
       }
 
-      if (message.type === "move-service"
-        && typeof message.id === "string" && typeof message.delta === "number"
+      /*
+       * Two ways to move a service: a step, from the up and down controls, and a destination,
+       * from a drop. A drop sends where it landed rather than a run of steps, so the board is
+       * written and the key redrawn once.
+       */
+      if (message.type === "move-service" && typeof message.id === "string"
         && options.onMoveService) {
-        await options.onMoveService(message.id, message.delta);
-        return { data: options.getOverview() };
+        if (typeof message.index === "number") {
+          await options.onMoveService(message.id, { index: message.index });
+          return { data: options.getOverview() };
+        }
+        if (typeof message.delta === "number") {
+          await options.onMoveService(message.id, { delta: message.delta });
+          return { data: options.getOverview() };
+        }
       }
 
       if (message.type === "update-board" && options.onUpdateBoard) {
