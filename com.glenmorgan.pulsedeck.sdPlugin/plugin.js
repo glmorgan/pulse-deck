@@ -248,6 +248,7 @@ function freeze(value) {
         Object.values(value).forEach(freeze);
     }
 }
+
 /**
  * Gets the value at the specified {@link path}.
  * @param source Source object that is being read from.
@@ -260,7 +261,7 @@ function get(source, path) {
 }
 
 /**
- * Internalization provider, responsible for managing localizations and translating resources.
+ * “Internationalization (i18n) provider, responsible for managing localizations and translating resources.
  */
 class I18nProvider {
     /**
@@ -2099,7 +2100,9 @@ let PerMessageDeflate$3 = class PerMessageDeflate {
             (typeof opts.serverMaxWindowBits === 'number' &&
               opts.serverMaxWindowBits > params.server_max_window_bits))) ||
         (typeof opts.clientMaxWindowBits === 'number' &&
-          !params.client_max_window_bits)
+          (typeof params.client_max_window_bits === 'number'
+            ? opts.clientMaxWindowBits > params.client_max_window_bits
+            : !params.client_max_window_bits))
       ) {
         return false;
       }
@@ -2693,6 +2696,7 @@ let Receiver$1 = class Receiver extends Writable {
 
     this._totalPayloadLength = 0;
     this._messageLength = 0;
+    this._numFragments = 0;
     this._fragments = [];
 
     this._errored = false;
@@ -3116,6 +3120,19 @@ let Receiver$1 = class Receiver extends Writable {
       return;
     }
 
+    if (this._maxFragments > 0 && ++this._numFragments > this._maxFragments) {
+      const error = this.createError(
+        RangeError,
+        'Too many message fragments',
+        false,
+        1008,
+        'WS_ERR_TOO_MANY_BUFFERED_PARTS'
+      );
+
+      cb(error);
+      return;
+    }
+
     if (this._compressed) {
       this._state = INFLATING;
       this.decompress(data, cb);
@@ -3123,22 +3140,6 @@ let Receiver$1 = class Receiver extends Writable {
     }
 
     if (data.length) {
-      if (
-        this._maxFragments > 0 &&
-        this._fragments.length >= this._maxFragments
-      ) {
-        const error = this.createError(
-          RangeError,
-          'Too many message fragments',
-          false,
-          1008,
-          'WS_ERR_TOO_MANY_BUFFERED_PARTS'
-        );
-
-        cb(error);
-        return;
-      }
-
       //
       // This message is not compressed so its length is the sum of the payload
       // length of all fragments.
@@ -3178,22 +3179,6 @@ let Receiver$1 = class Receiver extends Writable {
           return;
         }
 
-        if (
-          this._maxFragments > 0 &&
-          this._fragments.length >= this._maxFragments
-        ) {
-          const error = this.createError(
-            RangeError,
-            'Too many message fragments',
-            false,
-            1008,
-            'WS_ERR_TOO_MANY_BUFFERED_PARTS'
-          );
-
-          cb(error);
-          return;
-        }
-
         this._fragments.push(buf);
       }
 
@@ -3220,6 +3205,7 @@ let Receiver$1 = class Receiver extends Writable {
     this._totalPayloadLength = 0;
     this._messageLength = 0;
     this._fragmented = 0;
+    this._numFragments = 0;
     this._fragments = [];
 
     if (this._opcode === 2) {
@@ -5115,9 +5101,9 @@ var websocket = WebSocket;
  *     masking key
  * @param {Number} [options.handshakeTimeout] Timeout in milliseconds for the
  *     handshake request
- * @param {Number} [options.maxBufferedChunks=1048576] The maximum number of
+ * @param {Number} [options.maxBufferedChunks=262144] The maximum number of
  *     buffered data chunks
- * @param {Number} [options.maxFragments=131072] The maximum number of message
+ * @param {Number} [options.maxFragments=16384] The maximum number of message
  *     fragments
  * @param {Number} [options.maxPayload=104857600] The maximum allowed message
  *     size
@@ -5139,8 +5125,8 @@ function initAsClient(websocket, address, protocols, options) {
     autoPong: true,
     closeTimeout: CLOSE_TIMEOUT$1,
     protocolVersion: protocolVersions[1],
-    maxBufferedChunks: 1024 * 1024,
-    maxFragments: 128 * 1024,
+    maxBufferedChunks: 256 * 1024,
+    maxFragments: 16 * 1024,
     maxPayload: 100 * 1024 * 1024,
     skipUTF8Validation: false,
     perMessageDeflate: true,
@@ -6377,13 +6363,16 @@ class FileTarget {
         });
     }
     /**
-     * Re-indexes the existing log files associated with this file target, removing old log files whose index exceeds the {@link FileTargetOptions.maxFileCount}, and renaming the
-     * remaining log files, leaving index "0" free for a new log file.
+     * Re-indexes the existing log files associated with this file target, removing old log files whose
+     * index exceeds the `maxFileCount`, and renaming the remaining log files, leaving index "0" free
+     * for a new log file.
      */
     reIndex() {
         // When the destination directory is new, create it, and return.
         if (!fs.existsSync(this.#options.dest)) {
-            fs.mkdirSync(this.#options.dest);
+            fs.mkdirSync(this.#options.dest, {
+                recursive: true,
+            });
             return;
         }
         const logFiles = this.getLogFiles();
