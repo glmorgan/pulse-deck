@@ -20,6 +20,7 @@ var node_http = require('node:http');
 var node_child_process = require('node:child_process');
 var promises = require('node:fs/promises');
 var node_os = require('node:os');
+var node_util = require('node:util');
 
 /**
  * Default language supported by all i18n providers.
@@ -10755,6 +10756,16 @@ function escapeHtml(text) {
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#39;");
 }
+/** A page with an arrow leaving it: what is on the board goes out to a file. */
+const EXPORT_SVG = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"`
+    + ` stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+    + `<path d="M2.2 2.4h4.2l2.4 2.4v8.8H2.2z"/><path d="M6.4 2.4v2.4h2.4"/>`
+    + `<path d="M10.4 8.4h4.4"/><path d="M12.9 6.4l2 2-2 2"/></svg>`;
+/** The same page with the arrow arriving. */
+const IMPORT_SVG = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"`
+    + ` stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+    + `<path d="M2.2 2.4h4.2l2.4 2.4v8.8H2.2z"/><path d="M6.4 2.4v2.4h2.4"/>`
+    + `<path d="M14.8 8.4h-4.4"/><path d="M12.4 6.4l-2 2 2 2"/></svg>`;
 /** Lucide `plus`, ISC. */
 const PLUS_SVG = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor"`
     + ` stroke-width="2.4" stroke-linecap="round" aria-hidden="true">`
@@ -10933,6 +10944,20 @@ function renderBoardHtml(overview, token, options = {}) {
   .dot[data-state="warning"] { background: var(--warn); }
   .dot[data-state="down"] { background: var(--fail); }
   .rail-foot { display: flex; flex-direction: column; gap: 2px; }
+  /*
+   * Three groups in the rail: what is on the board, what adds to it, and what moves it in and
+   * out. The rule is what says the last two are a different kind of thing.
+   */
+  /*
+   * The occasional actions become one strip of icons rather than three labelled rows.
+   *
+   * Add service and Board settings stay rows, being reached for often enough to want naming.
+   * Export and import are rare enough to earn an icon each and no more, with their tooltips
+   * carrying the names.
+   */
+  .rail-tools { display: flex; gap: 4px; padding: 6px 9px 0; }
+  /* Tooltips sit above these, since there is nothing below them but the window edge. */
+  .rail-tools .iconbtn::after { top: auto; bottom: calc(100% + 6px); right: auto; left: 0; }
   .row.muted { color: var(--fg-dim); }
 
   /* ── detail ─────────────────────────────────────────────────────────── */
@@ -10970,6 +10995,7 @@ function renderBoardHtml(overview, token, options = {}) {
   }
   /* Any display rule outranks the browser's [hidden], so hiding one needs saying explicitly. */
   .iconbtn[hidden] { display: none; }
+  button.primary[hidden] { display: none; }
   .iconbtn:hover:not(:disabled) { background: var(--kbd); color: var(--fg); }
   .iconbtn:disabled { opacity: .4; cursor: default; }
   .iconbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -10989,7 +11015,11 @@ function renderBoardHtml(overview, token, options = {}) {
   }
   .iconbtn:hover::after, .iconbtn:focus-visible::after { opacity: 1; }
 
-  button.primary:disabled svg { animation: spin .9s linear infinite; transform-origin: 50% 50%; }
+  /*
+   * Tied to a class, not to :disabled. The button is also disabled when there is nothing to
+   * check, and an empty board sat there spinning as though a round were running forever.
+   */
+  button.primary.checking svg { animation: spin .9s linear infinite; transform-origin: 50% 50%; }
   @keyframes spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { button.primary:disabled svg { animation: none; } }
 
@@ -11003,8 +11033,16 @@ function renderBoardHtml(overview, token, options = {}) {
    * the pane is never showing a document mid-paint.
    */
   iframe.loading { position: absolute; inset: 0; opacity: 0; pointer-events: none; }
+  /*
+   * The pane fills whatever the head and the footer leave, whichever view is in it.
+   *
+   * Every view's own class said so and the empty state, which has no class, did not, so the
+   * footer rode up and sat under the message instead of at the foot of the window. Sizing
+   * belongs to the pane; the classes below only say how their contents are laid out.
+   */
+  #detail { flex: 1 1 auto; min-height: 0; }
   .grid {
-    flex: 1 1 auto; min-height: 0; overflow-y: auto;
+    overflow-y: auto;
     display: grid; grid-template-columns: repeat(3, 1fr); gap: 11px; align-content: start;
   }
   .cardbtn {
@@ -11094,10 +11132,16 @@ function renderBoardHtml(overview, token, options = {}) {
   .cardbtn[data-state="down"]:hover { background: #352626; }
   .cardbtn svg { display: block; width: 100%; height: 26px; margin-top: 4px; }
 
+  /* The message centres in the pane, which is why the pane has to be the one with the height. */
+  .emptyview { display: flex; }
   .empty {
-    flex: 1 1 auto; display: flex; align-items: center; justify-content: center;
-    color: var(--fg-faint); font-size: 12px; text-align: center; padding: 30px;
+    flex: 1 1 auto; display: flex; flex-direction: column; gap: 6px;
+    align-items: center; justify-content: center;
+    color: var(--fg-dim); font-size: 12px; text-align: center; padding: 30px;
   }
+  .empty p { margin: 0; max-width: 46ch; }
+  .emptyhead { font-size: 15px; font-weight: 500; color: var(--fg); }
+  .empty button.primary { margin-top: 12px; }
   /*
    * The selected service's view is the history window's own page in a frame.
    *
@@ -11241,6 +11285,128 @@ function renderBoardHtml(overview, token, options = {}) {
   }
   .error { color: #ff8080; font-size: 11.5px; padding-left: 144px; min-height: 15px; }
 
+  /* Picking services, for both export and import. */
+  .picknote, .pickwarn {
+    margin: 0 0 10px; font-size: 11.5px; color: var(--fg-dim); max-width: 70ch;
+  }
+  .pickwarn { color: #ffb27d; }
+  .picklist { display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
+  /*
+   * The picker fills its pane: list in the middle taking the room, actions pinned at the foot.
+   * Borrowing the form's layout put the buttons under the label column, indented past a list
+   * they belong to, and left the bottom of the pane empty.
+   */
+  .pickview { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  /*
+   * The head is not a row, it only lines up with one.
+   *
+   * It carried the row class so its tick sat in the same column, and inherited the selected
+   * tint along with it at equal specificity, which is a fight rather than a rule. It has its own
+   * layout now and shares nothing but the tick.
+   */
+  .pickhead {
+    display: flex; align-items: center; gap: 10px; cursor: pointer;
+    padding: 0 10px 8px; margin-bottom: 6px; border-bottom: 1px solid var(--line);
+  }
+  .pickhead input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .pickhead input:focus-visible + .pickbox { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .pickcount {
+    font-size: 10.5px; color: var(--fg-faint);
+    text-transform: uppercase; letter-spacing: .05em;
+  }
+  /* Some but not all: a dash rather than a tick. */
+  .pickbox.mixed { background: var(--accent); border-color: var(--accent); }
+  .pickbox.mixed::after {
+    content: ''; width: 8px; height: 2px; margin: 0; border: 0; border-radius: 1px;
+    background: var(--bg); transform: none; opacity: 1;
+  }
+  .pickactions {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+    padding-top: 11px; margin-top: 11px; border-top: 1px solid var(--line);
+  }
+  .pickactions .error { padding-left: 4px; }
+  .pickrow {
+    display: flex; align-items: center; gap: 10px;
+    padding: 5px 10px; border-radius: 8px; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .pickrow:hover { background: var(--hover); }
+  /* A chosen row is tinted and outlined, so the selection reads down the list at a glance. */
+  .pickrow.on { background: var(--kbd); border-color: var(--card-line); }
+  .pickrow:has(input:disabled) { opacity: .45; cursor: default; }
+
+  /* The native checkbox cannot take the window's palette, so it is hidden and drawn instead. */
+  .pickrow input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .pickbox {
+    flex: 0 0 auto; width: 16px; height: 16px; border-radius: 5px;
+    border: 1.5px solid var(--card-line); background: transparent;
+    display: grid; place-items: center; transition: background 90ms ease, border-color 90ms ease;
+  }
+  .pickrow.on .pickbox, .pickbox.checked { background: var(--accent); border-color: var(--accent); }
+  .pickbox::after {
+    content: ''; width: 8px; height: 4px; margin-top: -2px;
+    border-left: 2px solid var(--bg); border-bottom: 2px solid var(--bg);
+    transform: rotate(-45deg) scale(.6); opacity: 0;
+    transition: opacity 90ms ease, transform 90ms ease;
+  }
+  .pickrow.on .pickbox::after,
+  .pickbox.checked::after { opacity: 1; transform: rotate(-45deg) scale(1); }
+  .pickrow input:focus-visible + .pickbox { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .picktext {
+    min-width: 0; flex: 1 1 auto; display: flex; align-items: baseline; gap: 10px;
+  }
+  .pickname {
+    flex: 0 0 auto; max-width: 40%;
+    display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--fg);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* Readable rather than decorative: this was --fg-faint, which is for text you skip. */
+  .pickurl {
+    flex: 1 1 auto; min-width: 0; font-size: 11.5px; color: var(--fg-dim);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .pickskip { margin-left: auto; font-size: 11px; color: var(--fg-faint); }
+
+  /*
+   * A choice above the list, for the questions a picked file raises: whether to keep its values,
+   * and whether to write header values out. Laid out like a row and deliberately not one, so a
+   * decision about the whole list does not look like another thing to tick in it.
+   */
+  .pickopts { flex: 0 0 auto; display: flex; flex-direction: column; gap: 3px; margin-bottom: 11px; }
+  .pickopt {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 7px 10px; border-radius: 8px; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .pickopt:hover { background: var(--hover); }
+  .pickopt.on { background: var(--kbd); border-color: var(--card-line); }
+  .pickopt input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .pickopt .pickbox { margin-top: 1px; }
+  .pickopt input:focus-visible + .pickbox { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .pickopttext { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .pickopttext b { font-weight: 500; font-size: 12.5px; color: var(--fg); }
+  .pickopttext span { font-size: 11.5px; color: var(--fg-dim); max-width: 70ch; }
+  /* One of several: a dot rather than a tick. */
+  .pickbox.round { border-radius: 50%; }
+  .pickbox.round::after {
+    width: 6px; height: 6px; margin: 0; border: 0; border-radius: 50%;
+    background: var(--bg); transform: scale(.4);
+  }
+  .pickbox.round.checked::after { opacity: 1; transform: scale(1); }
+
+  /* What the file says against what this board says, side by side rather than in a sentence. */
+  .pickdiff {
+    flex: 0 0 auto; display: grid; grid-template-columns: auto auto auto;
+    gap: 4px 18px; align-items: baseline; justify-content: start;
+    margin: 0 0 11px; padding: 9px 12px;
+    border: 1px solid var(--card-line); border-radius: 8px; background: var(--card);
+  }
+  .diffhead {
+    font-size: 10px; color: var(--fg-faint); text-transform: uppercase; letter-spacing: .05em;
+  }
+  .difflabel { font-size: 11.5px; color: var(--fg-dim); }
+  .diffval { font-size: 11.5px; color: var(--fg); }
+
   /* A notice, in the footer's line rather than over the content it is about. */
   .notice { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--fg-dim); }
   .notice button {
@@ -11301,6 +11467,13 @@ function renderBoardHtml(overview, token, options = {}) {
     <button type="button" class="row muted" id="settings">
       <span class="rowicon">${SLIDERS_SVG}</span><span class="label">Board settings</span>
     </button>
+    <div class="rail-tools">
+      <button type="button" class="iconbtn" id="export"
+        aria-label="Export" data-tip="Export">${EXPORT_SVG}</button>
+      <button type="button" class="iconbtn" id="import"
+        aria-label="Import" data-tip="Import">${IMPORT_SVG}</button>
+    </div>
+
   </div>
 </nav>
 
@@ -11340,6 +11513,8 @@ function renderBoardHtml(overview, token, options = {}) {
    * changing that URL is the first thing anybody does anyway.
    */
   var formSeed = null;
+  /** What the opened file holds, while the import view is showing it. */
+  var importPreview = null;
   /** 'list' shows the selection; the others are the forms, which sit over it. */
   var view = 'list';
 
@@ -11434,6 +11609,8 @@ function renderBoardHtml(overview, token, options = {}) {
     var sub = data.total === 0 ? 'no services yet'
       : data.total + (data.total === 1 ? ' service · ' : ' services · ') + data.frequency;
     document.getElementById('board-sub').textContent = sub;
+
+    document.getElementById('export').disabled = data.total === 0;
 
     var add = document.getElementById('add');
     add.disabled = data.total >= data.capacity;
@@ -11719,10 +11896,18 @@ function renderBoardHtml(overview, token, options = {}) {
     paintSummary();
 
     if (!data.services.length) {
-      var note = el('div', 'empty',
-        'No services on this board yet. Add them from the key\\u2019s Property Inspector for now — '
-        + 'adding them here is the next piece of work.');
-      detail.className = '';
+      var note = el('div', 'empty');
+      note.appendChild(el('p', 'emptyhead', 'No services yet'));
+      note.appendChild(el('p', null,
+        'Add one and the board starts checking it straight away. Up to '
+        + data.capacity + ' fit on a key.'));
+      // The rail has an Add service row, but an empty board is the one time it needs saying
+      // loudly: there is nothing else on this view to look at.
+      var start = el('button', 'primary', 'Add your first service');
+      start.type = 'button';
+      start.addEventListener('click', function () { show('add'); });
+      note.appendChild(start);
+      detail.className = 'emptyview';
       detail.appendChild(note);
       return;
     }
@@ -12379,11 +12564,314 @@ function renderBoardHtml(overview, token, options = {}) {
     }));
   }
 
+  /**
+   * A list of services with a tick against each, shared by exporting and importing.
+   *
+   * Both directions ask the same question, so they ask it the same way: everything ticked to
+   * begin with, a count that follows the ticks, and a button that says how many it will act on.
+   */
+  /*
+   * A tick or a radio with a heading and a line under it. Returns the row and its input, so the
+   * caller reads the answer off the input rather than off a class.
+   */
+  function optionRow(type, title, body) {
+    var row = el('label', 'pickopt');
+    var input = document.createElement('input');
+    input.type = type;
+    var box = el('span', 'pickbox' + (type === 'radio' ? ' round' : ''));
+    var text = el('div', 'pickopttext');
+    text.appendChild(el('b', null, title));
+    if (body) text.appendChild(el('span', null, body));
+    row.appendChild(input);
+    row.appendChild(box);
+    row.appendChild(text);
+    function paint() {
+      box.classList.toggle('checked', input.checked);
+      row.classList.toggle('on', input.checked);
+    }
+    input.addEventListener('change', paint);
+    return { row: row, input: input, paint: paint };
+  }
+
+  /** "A", "A and B", "A, B and C". */
+  function joinWords(words) {
+    if (words.length < 2) return words[0] || '';
+    return words.slice(0, -1).join(', ') + ' and ' + words[words.length - 1];
+  }
+
+  function wrapOptions(options) {
+    var box = el('div', 'pickopts');
+    options.forEach(function (option) { box.appendChild(option.row); option.paint(); });
+    return box;
+  }
+
+  function diffTable(differences) {
+    var grid = el('div', 'pickdiff');
+    grid.appendChild(el('span', 'diffhead', ''));
+    grid.appendChild(el('span', 'diffhead', 'In the file'));
+    grid.appendChild(el('span', 'diffhead', 'This board'));
+    differences.forEach(function (difference) {
+      grid.appendChild(el('span', 'difflabel', difference.label));
+      grid.appendChild(el('span', 'diffval', difference.from));
+      grid.appendChild(el('span', 'diffval', difference.to));
+    });
+    return grid;
+  }
+
+  function pickList(rows, options) {
+    var detail = document.getElementById('detail');
+    detail.className = 'pickview';
+    detail.textContent = '';
+
+    if (options.note) detail.appendChild(el('p', 'picknote', options.note));
+    if (options.warning) detail.appendChild(el('p', 'pickwarn', options.warning));
+    // Anything the caller wants between what the file is and which of it to take.
+    (options.extra || []).forEach(function (node) { detail.appendChild(node); });
+
+    // The count and the select-all sit together above the list, where they describe it, rather
+    // than down among the actions.
+    /*
+     * A master tick at the head of the column it governs, rather than a word off to one side.
+     * It also carries the state: ticked, empty, or a dash when only some are chosen.
+     */
+    var head = el('label', 'pickhead');
+    var master = document.createElement('input');
+    master.type = 'checkbox';
+    var masterBox = el('span', 'pickbox');
+    var count = el('span', 'pickcount');
+    head.appendChild(master);
+    head.appendChild(masterBox);
+    head.appendChild(count);
+    detail.appendChild(head);
+
+    var list = el('div', 'picklist');
+    var boxes = [];
+    for (var i = 0; i < rows.length; i++) {
+      (function (row, index) {
+        var line = el('label', 'pickrow');
+        var box = document.createElement('input');
+        box.type = 'checkbox';
+        box.checked = !row.disabled;
+        box.disabled = !!row.disabled;
+        boxes.push({ box: box, index: index, line: line });
+        line.appendChild(box);
+        // The drawn box: the native control cannot be styled to the window's palette.
+        line.appendChild(el('span', 'pickbox'));
+
+        var text = el('span', 'picktext');
+        var nameLine = el('span', 'pickname');
+        // Export knows each service's state; a file being imported has never been checked.
+        if (row.state) {
+          var dot = el('i', 'dot');
+          dot.setAttribute('data-state', row.state);
+          nameLine.appendChild(dot);
+        }
+        nameLine.appendChild(el('span', null, row.name));
+        text.appendChild(nameLine);
+        text.appendChild(el('span', 'pickurl', row.url));
+        line.appendChild(text);
+        if (row.disabled) line.appendChild(el('span', 'pickskip', 'no room'));
+        line.addEventListener('change', paintCount);
+        list.appendChild(line);
+      })(rows[i], i);
+    }
+    detail.appendChild(list);
+
+    var error = el('div', 'error');
+    var actions = el('div', 'pickactions');
+    var go = el('button', 'primary', options.action);
+    go.type = 'button';
+    var cancel = el('button', 'ghost', 'Cancel');
+    cancel.type = 'button';
+    actions.appendChild(go);
+    actions.appendChild(cancel);
+    actions.appendChild(error);
+    detail.appendChild(actions);
+
+    function chosen() {
+      var out = [];
+      for (var i = 0; i < boxes.length; i++) if (boxes[i].box.checked) out.push(boxes[i].index);
+      return out;
+    }
+    function paintCount() {
+      var n = chosen().length;
+      go.textContent = options.action + (n ? ' (' + n + ')' : '');
+      go.disabled = n === 0;
+      var selectable = 0;
+      for (var i = 0; i < boxes.length; i++) {
+        boxes[i].line.classList.toggle('on', boxes[i].box.checked);
+        if (!boxes[i].box.disabled) selectable++;
+      }
+      count.textContent = n + ' of ' + boxes.length + ' selected';
+      master.checked = n > 0 && n === selectable;
+      master.indeterminate = n > 0 && n < selectable;
+      masterBox.classList.toggle('mixed', master.indeterminate);
+      masterBox.classList.toggle('checked', master.checked);
+    }
+    master.addEventListener('change', function () {
+      var wantAll = master.checked;
+      for (var i = 0; i < boxes.length; i++) {
+        if (!boxes[i].box.disabled) boxes[i].box.checked = wantAll;
+      }
+      paintCount();
+    });
+    cancel.addEventListener('click', function () { select(null); });
+    go.addEventListener('click', guard(options.action, function () {
+      go.disabled = true;
+      options.onGo(chosen(), function (message) {
+        go.disabled = false;
+        error.textContent = message || '';
+      });
+    }));
+    paintCount();
+  }
+
+  function paintExport() {
+    document.getElementById('title').textContent = 'Export';
+    document.getElementById('subtitle').textContent =
+      'Choose what to write to a file. Settings only, no history.';
+    document.getElementById('check').hidden = true;
+
+    var rows = data.services.map(function (service) {
+      return { name: service.name, url: service.url, state: service.state };
+    });
+
+    /*
+     * Header values are held back unless asked for, because a header is usually a key and a file
+     * is meant to be sendable. The names always go, so the file still says what is needed.
+     */
+    var names = [];
+    function collect(headers) {
+      (headers || []).forEach(function (header) {
+        if (header.name && names.indexOf(header.name) < 0) names.push(header.name);
+      });
+    }
+    collect(data.defaults.headers);
+    data.configs.forEach(function (config) { collect(config.headers); });
+
+    var secrets = null;
+    if (names.length) {
+      secrets = optionRow('checkbox', 'Include header values',
+        'The file will contain the values of ' + joinWords(names) + ' in plain text, so the board '
+        + 'works as soon as it is imported. Untick to write the names only, which is safer if the '
+        + 'file is going to somebody else.');
+      // On by default: an export is usually a backup, and one missing its credentials is not one.
+      secrets.input.checked = true;
+    }
+
+    pickList(rows, {
+      action: 'Export',
+      note: rows.length ? null : 'There is nothing on this board to export yet.',
+      extra: secrets ? [wrapOptions([secrets])] : null,
+      onGo: function (indexes, done) {
+        var ids = indexes.map(function (i) { return data.services[i].id; });
+        post('export', {
+          ids: ids,
+          includeHeaderValues: !!(secrets && secrets.input.checked)
+        }).then(function (reply) {
+          if (reply.message) return done(reply.message);
+          done('');
+          // A cancelled panel says nothing and leaves the form alone.
+          if (reply.saved) {
+            notice('Exported ' + ids.length + ' to ' + reply.saved);
+            select(null);
+          }
+        });
+      }
+    });
+  }
+
+  function paintImport(preview) {
+    document.getElementById('title').textContent = 'Import';
+    document.getElementById('subtitle').textContent =
+      'From ' + (preview.boardName || 'a board file') + '. Nothing is added until you say so.';
+    document.getElementById('check').hidden = true;
+
+    var room = data.capacity - data.total;
+    var rows = preview.services.map(function (service, i) {
+      return { name: service.name, url: service.url, disabled: i >= room };
+    });
+
+    var warning = null;
+    if (preview.overCapacity > 0) {
+      warning = 'This board has room for ' + room + ' more, so '
+        + preview.overCapacity + ' cannot be added.';
+    }
+
+    /*
+     * A service that overrides nothing is checked the way its board says, so the same service can
+     * behave differently once imported. The differences are shown and the choice is offered here,
+     * because this is the only point at which both boards are known.
+     */
+    var extra = null;
+    var keep = null;
+    if (preview.differences.length) {
+      var pinnable = preview.differences.filter(function (d) { return d.pinnable; });
+      var labels = pinnable.map(function (d) { return d.label; });
+      extra = [diffTable(preview.differences)];
+      if (pinnable.length) {
+        var follow = optionRow('radio', 'Follow this board',
+          'Imported services are checked the way everything else on this board is.');
+        keep = optionRow('radio', 'Keep the file\\'s values',
+          'Gives the imported services the file\\'s ' + joinWords(labels) + ', so they are '
+          + 'checked the way they were before. Everything else still follows this board.');
+        follow.input.name = 'defaults';
+        keep.input.name = 'defaults';
+        follow.input.checked = true;
+        // Radios in one group: the browser unchecks the other, but the drawn box is ours.
+        var repaint = function () { follow.paint(); keep.paint(); };
+        follow.input.addEventListener('change', repaint);
+        keep.input.addEventListener('change', repaint);
+        extra.push(wrapOptions([follow, keep]));
+      }
+    }
+
+    var notes = [];
+    var frequency = preview.differences.filter(function (d) { return d.key === 'checkFrequency'; });
+    if (frequency.length) {
+      notes.push('The whole board checks on one schedule, so these will be checked '
+        + frequency[0].to + (keep ? ' whichever you choose.' : ' like the rest of the board.'));
+    }
+    if (preview.needsHeaderValues.length) {
+      notes.push('This file lists ' + joinWords(preview.needsHeaderValues)
+        + ' with no value. Fill those in on each service after importing, or its checks will '
+        + 'fail.');
+    }
+
+    pickList(rows, {
+      action: 'Import',
+      note: notes.length ? notes.join(' ') : null,
+      warning: warning,
+      extra: extra,
+      onGo: function (indexes, done) {
+        post('import-confirm', {
+          indexes: indexes,
+          pin: !!(keep && keep.input.checked)
+        }).then(function (reply) {
+          if (reply.message) return done(reply.message);
+          done('');
+          apply(reply.data);
+          notice('Imported ' + (reply.added || 0));
+          select(null);
+        });
+      }
+    });
+  }
+
   function paintDetail() {
+    /*
+     * Hidden rather than disabled when there is nothing to check.
+     *
+     * The forms and the pickers already hide it, so it is a control that appears where it
+     * applies, not a fixture. On an empty board the view is one instruction, and a greyed out
+     * button beside it is a second thing to read that leads nowhere.
+     */
     var check = document.getElementById('check');
-    check.hidden = false;
+    check.hidden = data.total === 0;
     if (view === 'add' || view === 'edit') paintForm(view === 'edit' ? selected : null);
     else if (view === 'settings') paintSettings();
+    else if (view === 'export') paintExport();
+    else if (view === 'import') paintImport(importPreview);
     else if (selected === null) paintAll();
     else paintService(selected);
   }
@@ -12421,9 +12909,26 @@ function renderBoardHtml(overview, token, options = {}) {
     });
   }
 
+  /** A one-off message in the footer, for something that has already happened. */
+  var transientNotice = null;
+  function notice(text) {
+    transientNotice = text;
+    paintNotice();
+    setTimeout(function () {
+      if (transientNotice !== text) return;
+      transientNotice = null;
+      paintNotice();
+    }, 6000);
+  }
+
   function paintNotice() {
     var notice = document.getElementById('notice');
     notice.textContent = '';
+    if (transientNotice) {
+      notice.hidden = false;
+      notice.appendChild(el('span', null, transientNotice));
+      return;
+    }
     if (!data.undo) { notice.hidden = true; return; }
     notice.hidden = false;
     notice.appendChild(el('span', null, 'Deleted ' + data.undo + '.'));
@@ -12490,6 +12995,7 @@ function renderBoardHtml(overview, token, options = {}) {
     var button = document.getElementById('check');
     var label = document.getElementById('check-label');
     button.disabled = true;
+    button.classList.add('checking');
     label.textContent = 'Checking…';
     var request = selected === null
       ? post('check-all')
@@ -12498,7 +13004,8 @@ function renderBoardHtml(overview, token, options = {}) {
       apply(reply.data);
     }).then(function () {
       checking = false;
-      button.disabled = false;
+      button.disabled = data.total === 0;
+      button.classList.remove('checking');
       label.textContent = selected === null ? 'Check all' : 'Check now';
     });
   }
@@ -12517,6 +13024,20 @@ function renderBoardHtml(overview, token, options = {}) {
     show('add');
   });
   document.getElementById('settings').addEventListener('click', function () { show('settings'); });
+  document.getElementById('export').addEventListener('click', function () {
+    if (!data.total) return;
+    show('export');
+  });
+  document.getElementById('import').addEventListener('click', guard('import', function () {
+    // The panel is the plugin's to open, so the click asks and waits. A cancelled panel comes
+    // back with nothing and leaves the view alone.
+    post('import-open').then(function (reply) {
+      if (reply.message) { notice(reply.message); return; }
+      if (!reply.preview) return;
+      importPreview = reply.preview;
+      show('import');
+    });
+  }));
 
   /** Whether the keystroke belongs to a field the user is typing in. */
   function isTyping(e) {
@@ -12650,6 +13171,24 @@ async function showBoardWindow(hostPath, options) {
                     return { data: options.getOverview() };
                 }
             }
+            if (message.type === "export" && Array.isArray(message.ids) && options.onExport) {
+                const ids = message.ids.filter((id) => typeof id === "string");
+                const path = await options.onExport(ids, {
+                    includeHeaderValues: message.includeHeaderValues === true,
+                });
+                // A cancelled save panel is a normal outcome and gets no message.
+                return path ? { saved: path } : {};
+            }
+            if (message.type === "import-open" && options.onImportOpen) {
+                const preview = await options.onImportOpen();
+                return preview ? { preview } : {};
+            }
+            if (message.type === "import-confirm"
+                && Array.isArray(message.indexes) && options.onImportConfirm) {
+                const indexes = message.indexes.filter((i) => typeof i === "number");
+                const result = await options.onImportConfirm(indexes, { pin: message.pin === true });
+                return { data: options.getOverview(), ...result };
+            }
             if (message.type === "update-board" && options.onUpdateBoard) {
                 await options.onUpdateBoard(message.update);
                 return { data: options.getOverview() };
@@ -12668,6 +13207,302 @@ async function runSafely(work, warn, label) {
     catch (error) {
         warn?.(`${label} failed: ${error instanceof Error ? error.message : String(error)}`);
     }
+}
+
+/**
+ * Reading and writing a board as a file.
+ *
+ * Configuration only: services and the board's defaults, never runtime. History is per machine,
+ * is by far the largest part of a board's settings, and carries timestamps and error text from
+ * somebody's infrastructure. A file is meant to be reviewable, committable and sendable.
+ */
+/** Bumped only for a change a previous version could not read correctly. */
+const BOARD_FILE_VERSION = 1;
+/**
+ * Undefined counts as absent, not just null: a service saved before headers existed has no such
+ * field at all, and `resolveService` has always treated the two the same.
+ */
+function sealHeaders(headers, keep) {
+    if (!headers)
+        return null;
+    if (keep)
+        return headers;
+    return headers.map((header) => ({ name: header.name, value: "" }));
+}
+function exportBoard(settings, ids, options = {}) {
+    const wanted = new Set(ids);
+    const keep = options.includeHeaderValues !== false;
+    return {
+        pulsedeck: BOARD_FILE_VERSION,
+        exportedAt: new Date().toISOString(),
+        boardName: settings.boardName,
+        defaults: {
+            ...settings.defaults,
+            headers: sealHeaders(settings.defaults.headers, keep) ?? [],
+        },
+        // Export order follows the board, not the order they were ticked, so a file reads the way the
+        // key does.
+        services: settings.services
+            .filter((service) => wanted.has(service.id))
+            .map((service) => ({ ...service, headers: sealHeaders(service.headers, keep) })),
+    };
+}
+/** Header names that arrived without a value, so the import can say what still needs one. */
+function headersNeedingValues(file) {
+    const names = new Set();
+    const scan = (headers) => {
+        for (const header of headers ?? []) {
+            if (header?.name && !String(header.value ?? "").trim())
+                names.add(header.name);
+        }
+    };
+    scan(file.defaults.headers);
+    for (const service of file.services)
+        scan(service.headers);
+    return [...names];
+}
+function str(value, fallback = "") {
+    return typeof value === "string" ? value : fallback;
+}
+/** Overrides are `null` when absent, which is what "inherit" means everywhere else. */
+function optionalNumber(value) {
+    if (value === null || value === undefined || value === "")
+        return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+function optionalHeaders(value) {
+    if (!Array.isArray(value))
+        return null;
+    const headers = value
+        .filter((row) => !!row && typeof row === "object")
+        .map((row) => ({ name: str(row.name), value: str(row.value) }))
+        .filter((row) => row.name !== "");
+    return headers.length ? headers : null;
+}
+/**
+ * Rebuilds a service from a file, field by field.
+ *
+ * Deliberately not a spread of whatever the file held: a board file is an ordinary JSON document
+ * that someone may have hand-edited, and anything unrecognised has no business reaching settings
+ * that get persisted and merged. Every service also takes a fresh id, so importing the same file
+ * twice gives two services rather than one that silently overwrites the other.
+ */
+function readService(raw) {
+    if (!raw || typeof raw !== "object")
+        return null;
+    const source = raw;
+    const url = str(source.url).trim();
+    if (!url)
+        return null;
+    return {
+        id: newServiceId(),
+        name: str(source.name).trim(),
+        url,
+        expectedStatusCode: optionalNumber(source.expectedStatusCode),
+        timeoutMs: optionalNumber(source.timeoutMs),
+        slowThresholdMs: optionalNumber(source.slowThresholdMs),
+        amberAfterFailures: optionalNumber(source.amberAfterFailures),
+        redAfterFailures: optionalNumber(source.redAfterFailures),
+        recoverAfterSuccesses: optionalNumber(source.recoverAfterSuccesses),
+        expectedBodyContains: typeof source.expectedBodyContains === "string" ? source.expectedBodyContains : null,
+        showBodySnippetInHistory: typeof source.showBodySnippetInHistory === "boolean"
+            ? source.showBodySnippetInHistory
+            : null,
+        headers: optionalHeaders(source.headers),
+    };
+}
+/**
+ * Reads a file's text, refusing anything it cannot make sense of.
+ *
+ * The messages are what the window shows, so they say what is wrong with the file rather than
+ * naming a parser.
+ */
+function parseBoardFile(text) {
+    let raw;
+    try {
+        raw = JSON.parse(text);
+    }
+    catch {
+        return { ok: false, error: "That file is not JSON." };
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        return { ok: false, error: "That file does not contain a board." };
+    }
+    const source = raw;
+    const version = Number(source.pulsedeck);
+    if (!Number.isFinite(version)) {
+        return { ok: false, error: "That file was not exported from PulseDeck." };
+    }
+    if (version > BOARD_FILE_VERSION) {
+        return {
+            ok: false,
+            error: `That file was written by a newer version of PulseDeck (format ${version}).`,
+        };
+    }
+    if (!Array.isArray(source.services)) {
+        return { ok: false, error: "That file has no services in it." };
+    }
+    const services = source.services
+        .map(readService)
+        .filter((service) => service !== null);
+    if (!services.length) {
+        return { ok: false, error: "That file has no services with a URL in it." };
+    }
+    const savedDefaults = (source.defaults ?? {});
+    return {
+        ok: true,
+        file: {
+            pulsedeck: version,
+            exportedAt: str(source.exportedAt),
+            boardName: str(source.boardName, "Imported board"),
+            defaults: { ...DEFAULT_BOARD_DEFAULTS, ...savedDefaults },
+            services,
+        },
+    };
+}
+/**
+ * Fields a service can hold itself, so a file's value for them can be kept on import.
+ *
+ * `checkFrequency` is missing on purpose: the board checks its services in one round, so there is
+ * nowhere on a service to put a different frequency.
+ */
+const PINNABLE = [
+    "expectedStatusCode",
+    "timeoutMs",
+    "slowThresholdMs",
+    "amberAfterFailures",
+    "redAfterFailures",
+    "recoverAfterSuccesses",
+    "expectedBodyContains",
+    "headers",
+];
+const COMPARED = [
+    "checkFrequency",
+    "expectedStatusCode",
+    "timeoutMs",
+    "slowThresholdMs",
+    "amberAfterFailures",
+    "redAfterFailures",
+    "recoverAfterSuccesses",
+    "expectedBodyContains",
+    "headers",
+];
+const LABELS = {
+    checkFrequency: "Frequency",
+    expectedStatusCode: "Expected status",
+    timeoutMs: "Timeout",
+    slowThresholdMs: "Slow after",
+    amberAfterFailures: "Amber after",
+    redAfterFailures: "Red after",
+    recoverAfterSuccesses: "Recover after",
+    expectedBodyContains: "Body contains",
+    headers: "Headers",
+};
+function seconds(value) {
+    const ms = Number(value);
+    if (!Number.isFinite(ms))
+        return String(value);
+    return ms % 1000 === 0 ? `${ms / 1000}s` : `${ms}ms`;
+}
+function plural(value, one, many) {
+    return `${value} ${Number(value) === 1 ? one : many}`;
+}
+/** Values as the window shows them, since a raw field name and a raw number explain nothing. */
+function describe(key, value) {
+    switch (key) {
+        case "checkFrequency":
+            return frequencyLabel(String(value));
+        case "timeoutMs":
+        case "slowThresholdMs":
+            return seconds(value);
+        case "amberAfterFailures":
+        case "redAfterFailures":
+            return plural(value, "failure", "failures");
+        case "recoverAfterSuccesses":
+            return plural(value, "success", "successes");
+        case "expectedBodyContains":
+            return String(value ?? "").trim() ? `"${String(value)}"` : "nothing";
+        case "headers": {
+            const headers = value ?? [];
+            return headers.length ? headers.map((header) => header.name).join(", ") : "none";
+        }
+        default:
+            return String(value);
+    }
+}
+/**
+ * Which of a file's defaults differ from the board being imported into.
+ *
+ * A service that overrides nothing behaves according to its board, so the same service can check
+ * differently once imported. The window shows this and lets the import decide, rather than
+ * adopting the file's defaults, which would alter every service already on the board.
+ */
+function differingDefaults(file, board) {
+    const differences = [];
+    for (const key of COMPARED) {
+        if (JSON.stringify(file[key] ?? null) === JSON.stringify(board[key] ?? null))
+            continue;
+        differences.push({
+            key: String(key),
+            label: LABELS[key] ?? String(key),
+            from: describe(String(key), file[key]),
+            to: describe(String(key), board[key]),
+            pinnable: PINNABLE.includes(String(key)),
+        });
+    }
+    return differences;
+}
+/**
+ * Writes the file's defaults onto imported services, for the named fields only.
+ *
+ * Only the fields that differ, and only where the service inherits. Pinning every field would
+ * make each imported service a full copy of its old board's settings, so the board it lands on
+ * would no longer govern it, which is the opposite of what defaults are for.
+ */
+function pinDefaults(services, defaults, keys) {
+    const pin = keys.filter((key) => PINNABLE.includes(key));
+    if (!pin.length)
+        return services;
+    return services.map((service) => {
+        const pinned = { ...service };
+        for (const key of pin) {
+            if (pinned[key] === null || pinned[key] === undefined)
+                pinned[key] = defaults[key];
+        }
+        return pinned;
+    });
+}
+
+/**
+ * Asking the user for a file, through the native host.
+ *
+ * A plugin cannot do this itself: a Node process is not an application, so it has no way to put a
+ * dialog on screen, and shelling out to osascript costs around two seconds because the tool has to
+ * register as a foreground app first. The host is already an app and already shipped, so it does
+ * the asking and prints the chosen path.
+ *
+ * Only the native host can do this. A browser cannot be asked for a path at all, so on a machine
+ * without the host, importing and exporting are unavailable rather than half working.
+ */
+const run = node_util.promisify(node_child_process.execFile);
+/** Resolves to the chosen path, or null if the panel was cancelled. */
+async function chooseFile(options) {
+    const hosts = await findHosts();
+    const native = hosts.find((host) => host.endsWith("pulse-host"));
+    if (!native) {
+        throw new Error("Choosing a file needs the bundled helper, which is not available on this machine.");
+    }
+    const args = [options.saving ? "--save-panel" : "--open-panel"];
+    if (options.name)
+        args.push(`--name=${options.name}`);
+    if (options.prompt)
+        args.push(`--prompt=${options.prompt}`);
+    // No timeout: the panel is open for as long as somebody is deciding, and there is no sensible
+    // moment to give up on that.
+    const { stdout } = await run(native, args, { maxBuffer: 1024 * 64 });
+    const path = stdout.trim();
+    return path === "" ? null : path;
 }
 
 /**
@@ -12803,6 +13638,13 @@ let HealthBoardAction = (() => {
             if (instance.windowOpen)
                 return;
             instance.windowOpen = true;
+            /*
+             * The file a preview came from, between opening it and confirming what to take.
+             *
+             * Kept here rather than in settings: nothing about an unconfirmed file belongs in a saved
+             * board, and it should not survive the window being closed.
+             */
+            let pending = null;
             try {
                 for (const host of await findHosts()) {
                     try {
@@ -12903,6 +13745,70 @@ let HealthBoardAction = (() => {
                                 const [moved] = services.splice(from, 1);
                                 services.splice(clamped, 0, moved);
                                 await this.afterMutation(keyAction, instance);
+                            },
+                            onExport: async (ids, exportOptions) => {
+                                const file = exportBoard(instance.settings, ids, exportOptions);
+                                const suggested = (instance.settings.boardName || "board")
+                                    .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") + ".json";
+                                const path = await chooseFile({ saving: true, name: suggested, prompt: "Export board" });
+                                if (!path)
+                                    return null;
+                                await promises.writeFile(path, JSON.stringify(file, null, 2), "utf8");
+                                return path;
+                            },
+                            onImportOpen: async () => {
+                                const path = await chooseFile({ saving: false, prompt: "Import a board" });
+                                if (!path)
+                                    return null;
+                                const parsed = parseBoardFile(await promises.readFile(path, "utf8"));
+                                if (!parsed.ok)
+                                    throw new Error(parsed.error);
+                                // Held until the preview is confirmed, so choosing a file and choosing what comes
+                                // out of it are separate acts.
+                                pending = parsed.file;
+                                const room = BOARD_CAPACITY - instance.settings.services.length;
+                                return {
+                                    boardName: parsed.file.boardName,
+                                    services: parsed.file.services.map((service) => ({
+                                        name: service.name || hostOf(service.url),
+                                        url: service.url,
+                                    })),
+                                    differences: differingDefaults(parsed.file.defaults, instance.settings.defaults),
+                                    needsHeaderValues: headersNeedingValues(parsed.file),
+                                    overCapacity: Math.max(0, parsed.file.services.length - room),
+                                };
+                            },
+                            onImportConfirm: async (indexes, importOptions) => {
+                                if (!pending)
+                                    throw new Error("That file is no longer open.");
+                                // Decided here rather than at export: only now is the destination board known.
+                                const differences = differingDefaults(pending.defaults, instance.settings.defaults).map((difference) => difference.key);
+                                const services = importOptions.pin
+                                    ? pinDefaults(pending.services, pending.defaults, differences)
+                                    : pending.services;
+                                let added = 0;
+                                let skipped = 0;
+                                for (const index of indexes) {
+                                    const service = services[index];
+                                    if (!service)
+                                        continue;
+                                    if (instance.settings.services.length >= BOARD_CAPACITY) {
+                                        skipped += 1;
+                                        continue;
+                                    }
+                                    instance.settings.services.push(service);
+                                    instance.settings.runtime[service.id] = { ...EMPTY_RUNTIME };
+                                    added += 1;
+                                }
+                                pending = null;
+                                if (added) {
+                                    await this.afterMutation(keyAction, instance);
+                                    this.resetTimer(id, keyAction);
+                                    // Checked straight away, as an added service is: a file is exactly when you want
+                                    // to know whether these URLs work from here.
+                                    void this.runRound(id, keyAction);
+                                }
+                                return { added, skipped };
                             },
                             onUpdateBoard: async (update) => {
                                 const frequencyChanged = update.defaults?.checkFrequency !== undefined

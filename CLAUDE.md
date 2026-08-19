@@ -45,16 +45,26 @@ src/
   plugin.ts                   Entry point
   types.ts                    Shared types, ButtonState, HealthCheckSettings, defaults
   actions/
-    healthCheckAction.ts      Main action — lifecycle, key press, long press, timer
+    healthCheckAction.ts      Health Check — lifecycle, key press, long press, timer
+    healthBoardAction.ts      Health Board — rounds, key icon, the manager window's callbacks
+  board/
+    types.ts                  ServiceConfig, BoardDefaults, BoardSettings, runtime
+    board.ts                  resolveService, mergeBoardSettings, boardCells
+    boardSnapshot.ts          Everything the manager window shows, as plain data
+    boardWindow.ts            The manager window's page and routes
+    transfer.ts               Boards as files: export, parse, defaults, headers
   modules/
     healthChecker.ts          HTTP GET with AbortController timeout
     stateEvaluator.ts         State machine logic and config validation
     history.ts                60-check rolling history, uptime ratio, popup text
     snapshot.ts               Everything the history window shows, as plain data
-    historyWindow.ts          Local HTTP server, the window's page, host spawning
+    windowHost.ts             Server, token gate and host spawning, shared by both windows
+    historyWindow.ts          The single-service page; embeddable inside the board
+    filePanel.ts              Save and open panels, through the native host
     popup.ts                  macOS osascript dialog — the fallback when no host runs
     timerManager.ts           Per-key interval timer helpers
     iconGenerator.ts          Maps ButtonState → icon file path
+    boardIcon.ts              Board key face as an SVG data URI
 native/
   pulse-host.swift            Native window host (WKWebView in a non-activating NSPanel)
   build.sh                    Builds it universal and ad-hoc signs it into sdPlugin/bin/
@@ -123,6 +133,30 @@ plugin ──▶ HTTP server on 127.0.0.1:0 ──▶ native host (WKWebView) sh
 - **Stat tiles:** uptime, median, slow-response count and consecutive failures. Deliberately *not*
   a 95th percentile: over 60 spot checks, nearest-rank p95 is the third-slowest reading and on a
   young history it is simply the slowest, which the tile already showed underneath it.
+
+## Boards as files
+
+`transfer.ts` writes and reads a board. Versioned JSON (`pulsedeck: 1`), configuration only:
+services and the board's defaults, never runtime. History is per machine, is most of the settings
+by size, and carries timestamps and error text from somebody's infrastructure.
+
+- **Services keep inheriting.** A file records a service's overrides and nothing else, so `null`
+  still means "use the board's". Flattening the defaults onto each service at export would make
+  every imported service a frozen copy of its old board, which is the opposite of what defaults
+  are for.
+- **The inheritance question is answered at import**, because that is the only point where both
+  boards are known. `differingDefaults` compares them; when something differs the window shows a
+  table and offers to keep the file's values, which `pinDefaults` writes onto the imported
+  services for the differing fields only. Default is to follow the destination board.
+- **Frequency cannot travel.** The board checks its services in one round, so there is nowhere on
+  a service to put one. It is shown as a difference and excluded from `PINNABLE`.
+- **Header values are written by default**, because an export is usually a backup or a move to
+  another machine and one missing its credentials is not a backup: it imports into a board that
+  fails and says nothing about why. Unticking "Include header values" writes the names with empty
+  values instead, for a file going to somebody else, and the import then names what has to be
+  filled in. `exportBoard` defaults the same way, so there is one default rather than two.
+- **Import rebuilds each service field by field** with a fresh id, so a hand-edited file cannot
+  push unknown keys into persisted settings and importing the same file twice adds twice.
 
 ## Button states
 

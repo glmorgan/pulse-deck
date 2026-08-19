@@ -1,5 +1,6 @@
 import AppKit
 import WebKit
+import UniformTypeIdentifiers
 
 //
 // pulse-host — a native window that displays PulseDeck's health history page.
@@ -216,7 +217,107 @@ final class HistoryWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     }
 }
 
+// MARK: - file panels
+
+/*
+ * Save and open panels, behind --save-panel and --open-panel.
+ *
+ * The plugin cannot show these itself: a Node process is not an application, and osascript costs
+ * about two seconds because the tool has to register as a foreground app before it can put a
+ * dialog in front. This host is already an app, so it pays none of that.
+ */
+
+/// Centres a panel on the display the mouse is on, matching where the window opens.
+private func positionOnActiveScreen(_ window: NSWindow) {
+    let mouse = NSEvent.mouseLocation
+    let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
+    guard let area = screen?.visibleFrame else { window.center(); return }
+    let size = window.frame.size
+    let x = area.midX - size.width / 2
+    let y = area.maxY - size.height - (area.height - size.height) * verticalBias
+    window.setFrameOrigin(NSPoint(x: x.rounded(), y: y.rounded()))
+}
+
+private func runFilePanel(saving: Bool) -> String? {
+    let app = NSApplication.shared
+    /*
+     * .regular here, unlike the window, which is .accessory.
+     *
+     * Save and open panels are hosted out of process by macOS, so a nonactivating style mask never
+     * reaches the real window and they still depend on the app being allowed forward. An accessory
+     * app is background and macOS refuses it focus, which shows as a dialog you cannot type into.
+     * The cost is a Dock icon for as long as the dialog is up, which is what any app showing a save
+     * panel looks like.
+     */
+    app.setActivationPolicy(.regular)
+    app.activate(ignoringOtherApps: true)
+
+    func present(_ panel: NSSavePanel) {
+        panel.styleMask.insert(.nonactivatingPanel)
+        panel.level = .modalPanel
+        /*
+         * Asked for several times, not once. runModal starts its own run loop, so a single request
+         * scheduled beforehand can fire before the panel is presented and be dropped. Each attempt
+         * gives up as soon as the panel holds key status, so the usual case is one pass. Placement
+         * is explicit because ordering a panel front pre-empts AppKit's own, which leaves it in the
+         * bottom-left corner.
+         */
+        var placed = false
+        for delay in [0.0, 0.06, 0.15, 0.35, 0.7] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                if !placed {
+                    positionOnActiveScreen(panel)
+                    placed = true
+                }
+                guard !panel.isKeyWindow else { return }
+                NSApp.activate(ignoringOtherApps: true)
+                panel.makeKeyAndOrderFront(nil)
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            if !panel.isKeyWindow {
+                log("panel never took keyboard focus: appActive=\(NSApp.isActive)")
+            }
+        }
+    }
+
+    let prompt = flagValue("prompt") ?? (saving ? "Export" : "Import")
+    // JSON only, which is what a board is written as. The file is validated properly once read, so
+    // this saves someone from an obvious mistake rather than being a security boundary.
+    let types: [UTType] = [.json]
+
+    if saving {
+        let panel = NSSavePanel()
+        panel.message = prompt
+        panel.nameFieldStringValue = flagValue("name") ?? "board.json"
+        panel.allowedContentTypes = types
+        panel.canCreateDirectories = true
+        present(panel)
+        return panel.runModal() == .OK ? panel.url?.path : nil
+    }
+    let panel = NSOpenPanel()
+    panel.message = prompt
+    panel.allowedContentTypes = types
+    panel.allowsMultipleSelection = false
+    panel.canChooseDirectories = false
+    present(panel)
+    return panel.runModal() == .OK ? panel.url?.path : nil
+}
+
 // MARK: - entry point
+
+/*
+ * Panel modes need AppKit but no web view, and exit as soon as the dialog is answered. Cancelling
+ * prints nothing and still exits 0, so the caller reads an empty result rather than a failure.
+ */
+if CommandLine.arguments.contains("--save-panel") || CommandLine.arguments.contains("--open-panel") {
+    let saving = CommandLine.arguments.contains("--save-panel")
+    if let path = runFilePanel(saving: saving) {
+        FileHandle.standardOutput.write(path.data(using: .utf8)!)
+    }
+    exit(0)
+}
+
 
 guard let raw = flagValue("app"), let url = URL(string: raw), url.scheme != nil else {
     FileHandle.standardError.write(

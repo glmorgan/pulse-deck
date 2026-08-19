@@ -34,6 +34,16 @@ import { renderHistoryHtml } from "../modules/historyWindow.js";
 import { buildBoardOverview } from "../board/boardSnapshot.js";
 import { findHosts, showBoardWindow } from "../board/boardWindow.js";
 import {
+  differingDefaults,
+  exportBoard,
+  headersNeedingValues,
+  parseBoardFile,
+  pinDefaults,
+  type BoardFile,
+} from "../board/transfer.js";
+import { chooseFile } from "../modules/filePanel.js";
+import { readFile, writeFile } from "node:fs/promises";
+import {
   EMPTY_RUNTIME,
   type BoardDefaults,
   type BoardSettings,
@@ -191,6 +201,13 @@ export class HealthBoardAction extends SingletonAction<BoardSettings> {
     if (!instance) return;
     if (instance.windowOpen) return;
     instance.windowOpen = true;
+    /*
+     * The file a preview came from, between opening it and confirming what to take.
+     *
+     * Kept here rather than in settings: nothing about an unconfirmed file belongs in a saved
+     * board, and it should not survive the window being closed.
+     */
+    let pending: BoardFile | null = null;
 
     try {
       for (const host of await findHosts()) {
@@ -287,6 +304,68 @@ export class HealthBoardAction extends SingletonAction<BoardSettings> {
               const [moved] = services.splice(from, 1);
               services.splice(clamped, 0, moved);
               await this.afterMutation(keyAction, instance);
+            },
+            onExport: async (ids, exportOptions) => {
+              const file = exportBoard(instance.settings, ids, exportOptions);
+              const suggested = (instance.settings.boardName || "board")
+                .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") + ".json";
+              const path = await chooseFile({ saving: true, name: suggested, prompt: "Export board" });
+              if (!path) return null;
+              await writeFile(path, JSON.stringify(file, null, 2), "utf8");
+              return path;
+            },
+            onImportOpen: async () => {
+              const path = await chooseFile({ saving: false, prompt: "Import a board" });
+              if (!path) return null;
+              const parsed = parseBoardFile(await readFile(path, "utf8"));
+              if (!parsed.ok) throw new Error(parsed.error);
+              // Held until the preview is confirmed, so choosing a file and choosing what comes
+              // out of it are separate acts.
+              pending = parsed.file;
+              const room = BOARD_CAPACITY - instance.settings.services.length;
+              return {
+                boardName: parsed.file.boardName,
+                services: parsed.file.services.map((service) => ({
+                  name: service.name || hostOf(service.url),
+                  url: service.url,
+                })),
+                differences: differingDefaults(parsed.file.defaults, instance.settings.defaults),
+                needsHeaderValues: headersNeedingValues(parsed.file),
+                overCapacity: Math.max(0, parsed.file.services.length - room),
+              };
+            },
+            onImportConfirm: async (indexes, importOptions) => {
+              if (!pending) throw new Error("That file is no longer open.");
+              // Decided here rather than at export: only now is the destination board known.
+              const differences = differingDefaults(
+                pending.defaults,
+                instance.settings.defaults
+              ).map((difference) => difference.key);
+              const services = importOptions.pin
+                ? pinDefaults(pending.services, pending.defaults, differences)
+                : pending.services;
+              let added = 0;
+              let skipped = 0;
+              for (const index of indexes) {
+                const service = services[index];
+                if (!service) continue;
+                if (instance.settings.services.length >= BOARD_CAPACITY) {
+                  skipped += 1;
+                  continue;
+                }
+                instance.settings.services.push(service);
+                instance.settings.runtime[service.id] = { ...EMPTY_RUNTIME };
+                added += 1;
+              }
+              pending = null;
+              if (added) {
+                await this.afterMutation(keyAction, instance);
+                this.resetTimer(id, keyAction);
+                // Checked straight away, as an added service is: a file is exactly when you want
+                // to know whether these URLs work from here.
+                void this.runRound(id, keyAction);
+              }
+              return { added, skipped };
             },
             onUpdateBoard: async (update) => {
               const frequencyChanged =

@@ -73,12 +73,16 @@ function singleService(): HealthCheckSettings {
  * Scripts inserted through innerHTML never execute, which is what makes this deliberate rather
  * than automatic: each block is run in turn, so a throw lands in the test.
  */
-function run(html: string): { fetches: Record<string, unknown>[] } {
+function run(
+  html: string,
+  replies: Record<string, unknown> = {}
+): { fetches: Record<string, unknown>[] } {
   const fetches: Record<string, unknown>[] = [];
   // The pages talk to their own server. Nothing here should reach a network.
   vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: { body?: string }) => {
-    if (init?.body) fetches.push(JSON.parse(init.body) as Record<string, unknown>);
-    return { json: async () => ({}) };
+    const sent = init?.body ? JSON.parse(init.body) as Record<string, unknown> : {};
+    if (init?.body) fetches.push(sent);
+    return { json: async () => replies[String(sent.type)] ?? {} };
   }));
 
   // What the native host injects. Without it the head script tries to resize a window jsdom does
@@ -183,10 +187,127 @@ describe("the board page, running", () => {
     expect(inputs[1].value).toBe("https://payments.test/health");
   });
 
+  it("offers to include header values only when there are headers to include", () => {
+    const plain = board();
+    run(renderBoardHtml(buildBoardOverview(plain), "t"));
+    (document.getElementById("export") as HTMLElement).click();
+    expect(document.querySelector("#detail .pickopt")).toBeNull();
+
+    const withHeaders = board();
+    withHeaders.defaults.headers = [{ name: "X-Api-Key", value: "abc" }];
+    run(renderBoardHtml(buildBoardOverview(withHeaders), "t"));
+    (document.getElementById("export") as HTMLElement).click();
+    const option = document.querySelector("#detail .pickopt");
+    expect(option?.textContent).toContain("Include header values");
+    expect(option?.textContent).toContain("X-Api-Key");
+  });
+
+  it("sends the header choice with an export, on unless it was unticked", async () => {
+    // A file missing its credentials imports into a board that fails, and nothing says why, so
+    // the values go by default and leaving them out is the deliberate act.
+    const withHeaders = board();
+    withHeaders.defaults.headers = [{ name: "X-Api-Key", value: "abc" }];
+    const { fetches } = run(renderBoardHtml(buildBoardOverview(withHeaders), "t"));
+    (document.getElementById("export") as HTMLElement).click();
+
+    const go = document.querySelector("#detail .pickactions button") as HTMLElement;
+    go.click();
+    expect(fetches.at(-1)).toMatchObject({ type: "export", includeHeaderValues: true });
+    // The button disables itself until the panel answers, so let that round trip finish.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The label, as a user would: the native control is hidden and the box beside it is drawn.
+    (document.querySelector("#detail .pickopt") as HTMLElement).click();
+    go.click();
+    expect(fetches.at(-1)).toMatchObject({ includeHeaderValues: false });
+  });
+
+  it("shows what differs and offers to keep the file's values", async () => {
+    const preview = {
+      boardName: "Staging",
+      services: [{ name: "Payments", url: "https://payments.test/health" }],
+      differences: [
+        { key: "timeoutMs", label: "Timeout", from: "9s", to: "5s", pinnable: true },
+        {
+          key: "checkFrequency",
+          label: "Frequency",
+          from: "every minute",
+          to: "every 5 minutes",
+          pinnable: false,
+        },
+      ],
+      needsHeaderValues: ["X-Api-Key"],
+      overCapacity: 0,
+    };
+    const { fetches } = run(renderBoardHtml(buildBoardOverview(board()), "t"), {
+      "import-open": { preview },
+    });
+    (document.getElementById("import") as HTMLElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const table = document.querySelector("#detail .pickdiff") as HTMLElement;
+    expect(table.textContent).toContain("Timeout");
+    expect(table.textContent).toContain("9s");
+    // Frequency is shown but cannot be kept, so it is not one of the fields the choice names.
+    const choice = document.querySelectorAll("#detail .pickopt");
+    expect(choice).toHaveLength(2);
+    expect(choice[1].textContent).toContain("Timeout");
+    expect(choice[1].textContent).not.toContain("Frequency");
+    // A header with no value is worth saying out loud: those checks will fail until it is filled.
+    expect(document.querySelector("#detail .picknote")?.textContent).toContain("X-Api-Key");
+
+    (choice[1] as HTMLElement).click();
+    (document.querySelector("#detail .pickactions button") as HTMLElement).click();
+    expect(fetches.at(-1)).toMatchObject({ type: "import-confirm", pin: true });
+  });
+
+  it("asks nothing when the two boards agree", async () => {
+    const preview = {
+      boardName: "Staging",
+      services: [{ name: "Payments", url: "https://payments.test/health" }],
+      differences: [],
+      needsHeaderValues: [],
+      overCapacity: 0,
+    };
+    const { fetches } = run(renderBoardHtml(buildBoardOverview(board()), "t"), {
+      "import-open": { preview },
+    });
+    (document.getElementById("import") as HTMLElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(document.querySelector("#detail .pickdiff")).toBeNull();
+    expect(document.querySelector("#detail .pickopt")).toBeNull();
+    (document.querySelector("#detail .pickactions button") as HTMLElement).click();
+    expect(fetches.at(-1)).toMatchObject({ type: "import-confirm", pin: false });
+  });
+
   it("renders an empty board without falling over", () => {
     run(renderBoardHtml(buildBoardOverview(mergeBoardSettings(undefined)), "t"));
     expect(document.querySelectorAll("#list .row[data-id]")).toHaveLength(0);
-    expect(document.querySelector("#detail")?.textContent).toContain("No services");
+    expect(document.querySelector("#detail")?.textContent).toContain("No services yet");
+  });
+
+  it("puts a way to start on an empty board, since there is nothing else on the view", () => {
+    run(renderBoardHtml(buildBoardOverview(mergeBoardSettings(undefined)), "t"));
+    const start = document.querySelector("#detail .empty button.primary") as HTMLElement;
+    expect(start.textContent).toBe("Add your first service");
+
+    start.click();
+    expect(document.getElementById("title")?.textContent).toBe("Add service");
+  });
+
+  it("hides the check button when there is nothing to check", () => {
+    // It was disabled and spinning, the spin being tied to :disabled. Disabled was the wrong
+    // answer anyway: on an empty board the view is one instruction and nothing else.
+    run(renderBoardHtml(buildBoardOverview(mergeBoardSettings(undefined)), "t"));
+    const check = document.getElementById("check") as HTMLButtonElement;
+    expect(check.hidden).toBe(true);
+    expect(check.classList.contains("checking")).toBe(false);
+  });
+
+  it("shows it again as soon as there is a service", () => {
+    run(renderBoardHtml(buildBoardOverview(board()), "t"));
+    expect((document.getElementById("check") as HTMLButtonElement).hidden).toBe(false);
   });
 });
 

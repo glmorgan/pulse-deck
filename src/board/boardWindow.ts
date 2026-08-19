@@ -1,6 +1,7 @@
 import { findHosts, serveWindow } from "../modules/windowHost.js";
 import type { HistorySnapshot } from "../modules/snapshot.js";
 import type { BoardOverview } from "./boardSnapshot.js";
+import type { DefaultDifference } from "./transfer.js";
 import type { BoardDefaults, ServiceConfig } from "./types.js";
 
 /**
@@ -51,6 +52,23 @@ export type BoardWindowOptions = {
   onUndoDelete?: () => Promise<string>;
   onMoveService?: (id: string, to: { delta?: number; index?: number }) => Promise<void>;
   onUpdateBoard?: (update: BoardUpdate) => Promise<void>;
+
+  /**
+   * Writes the chosen services to a file the user picks. Returns where it went, or null if the
+   * save panel was cancelled, which is not an error and says nothing.
+   */
+  onExport?: (ids: string[], options: { includeHeaderValues: boolean }) => Promise<string | null>;
+  /**
+   * Opens a file and reports what is in it. Nothing is added by this call: importing without
+   * showing what a file holds would merge an unknown number of services into a board sight
+   * unseen, from a file that may have come from somebody else.
+   */
+  onImportOpen?: () => Promise<ImportPreview | null>;
+  /** Adds the chosen services from the file last opened. */
+  onImportConfirm?: (
+    indexes: number[],
+    options: { pin: boolean }
+  ) => Promise<{ added: number; skipped: number }>;
   onOpen?: (close: () => void) => void;
   onWarn?: (message: string) => void;
   timeoutMs?: number;
@@ -60,6 +78,18 @@ export type BoardWindowOptions = {
 
 /** What the add and edit forms send. Everything but name and URL may be null, meaning inherit. */
 export type ServiceDraft = Omit<ServiceConfig, "id">;
+
+/** What a file turned out to hold, for review before anything is added. */
+export type ImportPreview = {
+  boardName: string;
+  services: { name: string; url: string }[];
+  /** Board defaults that differ from this board's, since a service inherits where it lands. */
+  differences: DefaultDifference[];
+  /** Headers the file names but has no value for, because the export held the values back. */
+  needsHeaderValues: string[];
+  /** How many of the file's services will not fit, so the preview can say so up front. */
+  overCapacity: number;
+};
 
 export type BoardUpdate = {
   boardName?: string;
@@ -96,6 +126,20 @@ function escapeHtml(text: string): string {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 }
+
+/** A page with an arrow leaving it: what is on the board goes out to a file. */
+const EXPORT_SVG =
+  `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"`
+  + ` stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+  + `<path d="M2.2 2.4h4.2l2.4 2.4v8.8H2.2z"/><path d="M6.4 2.4v2.4h2.4"/>`
+  + `<path d="M10.4 8.4h4.4"/><path d="M12.9 6.4l2 2-2 2"/></svg>`;
+
+/** The same page with the arrow arriving. */
+const IMPORT_SVG =
+  `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor"`
+  + ` stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+  + `<path d="M2.2 2.4h4.2l2.4 2.4v8.8H2.2z"/><path d="M6.4 2.4v2.4h2.4"/>`
+  + `<path d="M14.8 8.4h-4.4"/><path d="M12.4 6.4l-2 2 2 2"/></svg>`;
 
 /** Lucide `plus`, ISC. */
 const PLUS_SVG =
@@ -292,6 +336,20 @@ export function renderBoardHtml(
   .dot[data-state="warning"] { background: var(--warn); }
   .dot[data-state="down"] { background: var(--fail); }
   .rail-foot { display: flex; flex-direction: column; gap: 2px; }
+  /*
+   * Three groups in the rail: what is on the board, what adds to it, and what moves it in and
+   * out. The rule is what says the last two are a different kind of thing.
+   */
+  /*
+   * The occasional actions become one strip of icons rather than three labelled rows.
+   *
+   * Add service and Board settings stay rows, being reached for often enough to want naming.
+   * Export and import are rare enough to earn an icon each and no more, with their tooltips
+   * carrying the names.
+   */
+  .rail-tools { display: flex; gap: 4px; padding: 6px 9px 0; }
+  /* Tooltips sit above these, since there is nothing below them but the window edge. */
+  .rail-tools .iconbtn::after { top: auto; bottom: calc(100% + 6px); right: auto; left: 0; }
   .row.muted { color: var(--fg-dim); }
 
   /* ── detail ─────────────────────────────────────────────────────────── */
@@ -329,6 +387,7 @@ export function renderBoardHtml(
   }
   /* Any display rule outranks the browser's [hidden], so hiding one needs saying explicitly. */
   .iconbtn[hidden] { display: none; }
+  button.primary[hidden] { display: none; }
   .iconbtn:hover:not(:disabled) { background: var(--kbd); color: var(--fg); }
   .iconbtn:disabled { opacity: .4; cursor: default; }
   .iconbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -348,7 +407,11 @@ export function renderBoardHtml(
   }
   .iconbtn:hover::after, .iconbtn:focus-visible::after { opacity: 1; }
 
-  button.primary:disabled svg { animation: spin .9s linear infinite; transform-origin: 50% 50%; }
+  /*
+   * Tied to a class, not to :disabled. The button is also disabled when there is nothing to
+   * check, and an empty board sat there spinning as though a round were running forever.
+   */
+  button.primary.checking svg { animation: spin .9s linear infinite; transform-origin: 50% 50%; }
   @keyframes spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { button.primary:disabled svg { animation: none; } }
 
@@ -362,8 +425,16 @@ export function renderBoardHtml(
    * the pane is never showing a document mid-paint.
    */
   iframe.loading { position: absolute; inset: 0; opacity: 0; pointer-events: none; }
+  /*
+   * The pane fills whatever the head and the footer leave, whichever view is in it.
+   *
+   * Every view's own class said so and the empty state, which has no class, did not, so the
+   * footer rode up and sat under the message instead of at the foot of the window. Sizing
+   * belongs to the pane; the classes below only say how their contents are laid out.
+   */
+  #detail { flex: 1 1 auto; min-height: 0; }
   .grid {
-    flex: 1 1 auto; min-height: 0; overflow-y: auto;
+    overflow-y: auto;
     display: grid; grid-template-columns: repeat(3, 1fr); gap: 11px; align-content: start;
   }
   .cardbtn {
@@ -453,10 +524,16 @@ export function renderBoardHtml(
   .cardbtn[data-state="down"]:hover { background: #352626; }
   .cardbtn svg { display: block; width: 100%; height: 26px; margin-top: 4px; }
 
+  /* The message centres in the pane, which is why the pane has to be the one with the height. */
+  .emptyview { display: flex; }
   .empty {
-    flex: 1 1 auto; display: flex; align-items: center; justify-content: center;
-    color: var(--fg-faint); font-size: 12px; text-align: center; padding: 30px;
+    flex: 1 1 auto; display: flex; flex-direction: column; gap: 6px;
+    align-items: center; justify-content: center;
+    color: var(--fg-dim); font-size: 12px; text-align: center; padding: 30px;
   }
+  .empty p { margin: 0; max-width: 46ch; }
+  .emptyhead { font-size: 15px; font-weight: 500; color: var(--fg); }
+  .empty button.primary { margin-top: 12px; }
   /*
    * The selected service's view is the history window's own page in a frame.
    *
@@ -600,6 +677,128 @@ export function renderBoardHtml(
   }
   .error { color: #ff8080; font-size: 11.5px; padding-left: 144px; min-height: 15px; }
 
+  /* Picking services, for both export and import. */
+  .picknote, .pickwarn {
+    margin: 0 0 10px; font-size: 11.5px; color: var(--fg-dim); max-width: 70ch;
+  }
+  .pickwarn { color: #ffb27d; }
+  .picklist { display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
+  /*
+   * The picker fills its pane: list in the middle taking the room, actions pinned at the foot.
+   * Borrowing the form's layout put the buttons under the label column, indented past a list
+   * they belong to, and left the bottom of the pane empty.
+   */
+  .pickview { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  /*
+   * The head is not a row, it only lines up with one.
+   *
+   * It carried the row class so its tick sat in the same column, and inherited the selected
+   * tint along with it at equal specificity, which is a fight rather than a rule. It has its own
+   * layout now and shares nothing but the tick.
+   */
+  .pickhead {
+    display: flex; align-items: center; gap: 10px; cursor: pointer;
+    padding: 0 10px 8px; margin-bottom: 6px; border-bottom: 1px solid var(--line);
+  }
+  .pickhead input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .pickhead input:focus-visible + .pickbox { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .pickcount {
+    font-size: 10.5px; color: var(--fg-faint);
+    text-transform: uppercase; letter-spacing: .05em;
+  }
+  /* Some but not all: a dash rather than a tick. */
+  .pickbox.mixed { background: var(--accent); border-color: var(--accent); }
+  .pickbox.mixed::after {
+    content: ''; width: 8px; height: 2px; margin: 0; border: 0; border-radius: 1px;
+    background: var(--bg); transform: none; opacity: 1;
+  }
+  .pickactions {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+    padding-top: 11px; margin-top: 11px; border-top: 1px solid var(--line);
+  }
+  .pickactions .error { padding-left: 4px; }
+  .pickrow {
+    display: flex; align-items: center; gap: 10px;
+    padding: 5px 10px; border-radius: 8px; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .pickrow:hover { background: var(--hover); }
+  /* A chosen row is tinted and outlined, so the selection reads down the list at a glance. */
+  .pickrow.on { background: var(--kbd); border-color: var(--card-line); }
+  .pickrow:has(input:disabled) { opacity: .45; cursor: default; }
+
+  /* The native checkbox cannot take the window's palette, so it is hidden and drawn instead. */
+  .pickrow input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .pickbox {
+    flex: 0 0 auto; width: 16px; height: 16px; border-radius: 5px;
+    border: 1.5px solid var(--card-line); background: transparent;
+    display: grid; place-items: center; transition: background 90ms ease, border-color 90ms ease;
+  }
+  .pickrow.on .pickbox, .pickbox.checked { background: var(--accent); border-color: var(--accent); }
+  .pickbox::after {
+    content: ''; width: 8px; height: 4px; margin-top: -2px;
+    border-left: 2px solid var(--bg); border-bottom: 2px solid var(--bg);
+    transform: rotate(-45deg) scale(.6); opacity: 0;
+    transition: opacity 90ms ease, transform 90ms ease;
+  }
+  .pickrow.on .pickbox::after,
+  .pickbox.checked::after { opacity: 1; transform: rotate(-45deg) scale(1); }
+  .pickrow input:focus-visible + .pickbox { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .picktext {
+    min-width: 0; flex: 1 1 auto; display: flex; align-items: baseline; gap: 10px;
+  }
+  .pickname {
+    flex: 0 0 auto; max-width: 40%;
+    display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--fg);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* Readable rather than decorative: this was --fg-faint, which is for text you skip. */
+  .pickurl {
+    flex: 1 1 auto; min-width: 0; font-size: 11.5px; color: var(--fg-dim);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .pickskip { margin-left: auto; font-size: 11px; color: var(--fg-faint); }
+
+  /*
+   * A choice above the list, for the questions a picked file raises: whether to keep its values,
+   * and whether to write header values out. Laid out like a row and deliberately not one, so a
+   * decision about the whole list does not look like another thing to tick in it.
+   */
+  .pickopts { flex: 0 0 auto; display: flex; flex-direction: column; gap: 3px; margin-bottom: 11px; }
+  .pickopt {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 7px 10px; border-radius: 8px; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .pickopt:hover { background: var(--hover); }
+  .pickopt.on { background: var(--kbd); border-color: var(--card-line); }
+  .pickopt input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .pickopt .pickbox { margin-top: 1px; }
+  .pickopt input:focus-visible + .pickbox { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .pickopttext { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .pickopttext b { font-weight: 500; font-size: 12.5px; color: var(--fg); }
+  .pickopttext span { font-size: 11.5px; color: var(--fg-dim); max-width: 70ch; }
+  /* One of several: a dot rather than a tick. */
+  .pickbox.round { border-radius: 50%; }
+  .pickbox.round::after {
+    width: 6px; height: 6px; margin: 0; border: 0; border-radius: 50%;
+    background: var(--bg); transform: scale(.4);
+  }
+  .pickbox.round.checked::after { opacity: 1; transform: scale(1); }
+
+  /* What the file says against what this board says, side by side rather than in a sentence. */
+  .pickdiff {
+    flex: 0 0 auto; display: grid; grid-template-columns: auto auto auto;
+    gap: 4px 18px; align-items: baseline; justify-content: start;
+    margin: 0 0 11px; padding: 9px 12px;
+    border: 1px solid var(--card-line); border-radius: 8px; background: var(--card);
+  }
+  .diffhead {
+    font-size: 10px; color: var(--fg-faint); text-transform: uppercase; letter-spacing: .05em;
+  }
+  .difflabel { font-size: 11.5px; color: var(--fg-dim); }
+  .diffval { font-size: 11.5px; color: var(--fg); }
+
   /* A notice, in the footer's line rather than over the content it is about. */
   .notice { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--fg-dim); }
   .notice button {
@@ -660,6 +859,13 @@ export function renderBoardHtml(
     <button type="button" class="row muted" id="settings">
       <span class="rowicon">${SLIDERS_SVG}</span><span class="label">Board settings</span>
     </button>
+    <div class="rail-tools">
+      <button type="button" class="iconbtn" id="export"
+        aria-label="Export" data-tip="Export">${EXPORT_SVG}</button>
+      <button type="button" class="iconbtn" id="import"
+        aria-label="Import" data-tip="Import">${IMPORT_SVG}</button>
+    </div>
+
   </div>
 </nav>
 
@@ -699,6 +905,8 @@ export function renderBoardHtml(
    * changing that URL is the first thing anybody does anyway.
    */
   var formSeed = null;
+  /** What the opened file holds, while the import view is showing it. */
+  var importPreview = null;
   /** 'list' shows the selection; the others are the forms, which sit over it. */
   var view = 'list';
 
@@ -793,6 +1001,8 @@ export function renderBoardHtml(
     var sub = data.total === 0 ? 'no services yet'
       : data.total + (data.total === 1 ? ' service · ' : ' services · ') + data.frequency;
     document.getElementById('board-sub').textContent = sub;
+
+    document.getElementById('export').disabled = data.total === 0;
 
     var add = document.getElementById('add');
     add.disabled = data.total >= data.capacity;
@@ -1078,10 +1288,18 @@ export function renderBoardHtml(
     paintSummary();
 
     if (!data.services.length) {
-      var note = el('div', 'empty',
-        'No services on this board yet. Add them from the key\\u2019s Property Inspector for now — '
-        + 'adding them here is the next piece of work.');
-      detail.className = '';
+      var note = el('div', 'empty');
+      note.appendChild(el('p', 'emptyhead', 'No services yet'));
+      note.appendChild(el('p', null,
+        'Add one and the board starts checking it straight away. Up to '
+        + data.capacity + ' fit on a key.'));
+      // The rail has an Add service row, but an empty board is the one time it needs saying
+      // loudly: there is nothing else on this view to look at.
+      var start = el('button', 'primary', 'Add your first service');
+      start.type = 'button';
+      start.addEventListener('click', function () { show('add'); });
+      note.appendChild(start);
+      detail.className = 'emptyview';
       detail.appendChild(note);
       return;
     }
@@ -1738,11 +1956,314 @@ export function renderBoardHtml(
     }));
   }
 
+  /**
+   * A list of services with a tick against each, shared by exporting and importing.
+   *
+   * Both directions ask the same question, so they ask it the same way: everything ticked to
+   * begin with, a count that follows the ticks, and a button that says how many it will act on.
+   */
+  /*
+   * A tick or a radio with a heading and a line under it. Returns the row and its input, so the
+   * caller reads the answer off the input rather than off a class.
+   */
+  function optionRow(type, title, body) {
+    var row = el('label', 'pickopt');
+    var input = document.createElement('input');
+    input.type = type;
+    var box = el('span', 'pickbox' + (type === 'radio' ? ' round' : ''));
+    var text = el('div', 'pickopttext');
+    text.appendChild(el('b', null, title));
+    if (body) text.appendChild(el('span', null, body));
+    row.appendChild(input);
+    row.appendChild(box);
+    row.appendChild(text);
+    function paint() {
+      box.classList.toggle('checked', input.checked);
+      row.classList.toggle('on', input.checked);
+    }
+    input.addEventListener('change', paint);
+    return { row: row, input: input, paint: paint };
+  }
+
+  /** "A", "A and B", "A, B and C". */
+  function joinWords(words) {
+    if (words.length < 2) return words[0] || '';
+    return words.slice(0, -1).join(', ') + ' and ' + words[words.length - 1];
+  }
+
+  function wrapOptions(options) {
+    var box = el('div', 'pickopts');
+    options.forEach(function (option) { box.appendChild(option.row); option.paint(); });
+    return box;
+  }
+
+  function diffTable(differences) {
+    var grid = el('div', 'pickdiff');
+    grid.appendChild(el('span', 'diffhead', ''));
+    grid.appendChild(el('span', 'diffhead', 'In the file'));
+    grid.appendChild(el('span', 'diffhead', 'This board'));
+    differences.forEach(function (difference) {
+      grid.appendChild(el('span', 'difflabel', difference.label));
+      grid.appendChild(el('span', 'diffval', difference.from));
+      grid.appendChild(el('span', 'diffval', difference.to));
+    });
+    return grid;
+  }
+
+  function pickList(rows, options) {
+    var detail = document.getElementById('detail');
+    detail.className = 'pickview';
+    detail.textContent = '';
+
+    if (options.note) detail.appendChild(el('p', 'picknote', options.note));
+    if (options.warning) detail.appendChild(el('p', 'pickwarn', options.warning));
+    // Anything the caller wants between what the file is and which of it to take.
+    (options.extra || []).forEach(function (node) { detail.appendChild(node); });
+
+    // The count and the select-all sit together above the list, where they describe it, rather
+    // than down among the actions.
+    /*
+     * A master tick at the head of the column it governs, rather than a word off to one side.
+     * It also carries the state: ticked, empty, or a dash when only some are chosen.
+     */
+    var head = el('label', 'pickhead');
+    var master = document.createElement('input');
+    master.type = 'checkbox';
+    var masterBox = el('span', 'pickbox');
+    var count = el('span', 'pickcount');
+    head.appendChild(master);
+    head.appendChild(masterBox);
+    head.appendChild(count);
+    detail.appendChild(head);
+
+    var list = el('div', 'picklist');
+    var boxes = [];
+    for (var i = 0; i < rows.length; i++) {
+      (function (row, index) {
+        var line = el('label', 'pickrow');
+        var box = document.createElement('input');
+        box.type = 'checkbox';
+        box.checked = !row.disabled;
+        box.disabled = !!row.disabled;
+        boxes.push({ box: box, index: index, line: line });
+        line.appendChild(box);
+        // The drawn box: the native control cannot be styled to the window's palette.
+        line.appendChild(el('span', 'pickbox'));
+
+        var text = el('span', 'picktext');
+        var nameLine = el('span', 'pickname');
+        // Export knows each service's state; a file being imported has never been checked.
+        if (row.state) {
+          var dot = el('i', 'dot');
+          dot.setAttribute('data-state', row.state);
+          nameLine.appendChild(dot);
+        }
+        nameLine.appendChild(el('span', null, row.name));
+        text.appendChild(nameLine);
+        text.appendChild(el('span', 'pickurl', row.url));
+        line.appendChild(text);
+        if (row.disabled) line.appendChild(el('span', 'pickskip', 'no room'));
+        line.addEventListener('change', paintCount);
+        list.appendChild(line);
+      })(rows[i], i);
+    }
+    detail.appendChild(list);
+
+    var error = el('div', 'error');
+    var actions = el('div', 'pickactions');
+    var go = el('button', 'primary', options.action);
+    go.type = 'button';
+    var cancel = el('button', 'ghost', 'Cancel');
+    cancel.type = 'button';
+    actions.appendChild(go);
+    actions.appendChild(cancel);
+    actions.appendChild(error);
+    detail.appendChild(actions);
+
+    function chosen() {
+      var out = [];
+      for (var i = 0; i < boxes.length; i++) if (boxes[i].box.checked) out.push(boxes[i].index);
+      return out;
+    }
+    function paintCount() {
+      var n = chosen().length;
+      go.textContent = options.action + (n ? ' (' + n + ')' : '');
+      go.disabled = n === 0;
+      var selectable = 0;
+      for (var i = 0; i < boxes.length; i++) {
+        boxes[i].line.classList.toggle('on', boxes[i].box.checked);
+        if (!boxes[i].box.disabled) selectable++;
+      }
+      count.textContent = n + ' of ' + boxes.length + ' selected';
+      master.checked = n > 0 && n === selectable;
+      master.indeterminate = n > 0 && n < selectable;
+      masterBox.classList.toggle('mixed', master.indeterminate);
+      masterBox.classList.toggle('checked', master.checked);
+    }
+    master.addEventListener('change', function () {
+      var wantAll = master.checked;
+      for (var i = 0; i < boxes.length; i++) {
+        if (!boxes[i].box.disabled) boxes[i].box.checked = wantAll;
+      }
+      paintCount();
+    });
+    cancel.addEventListener('click', function () { select(null); });
+    go.addEventListener('click', guard(options.action, function () {
+      go.disabled = true;
+      options.onGo(chosen(), function (message) {
+        go.disabled = false;
+        error.textContent = message || '';
+      });
+    }));
+    paintCount();
+  }
+
+  function paintExport() {
+    document.getElementById('title').textContent = 'Export';
+    document.getElementById('subtitle').textContent =
+      'Choose what to write to a file. Settings only, no history.';
+    document.getElementById('check').hidden = true;
+
+    var rows = data.services.map(function (service) {
+      return { name: service.name, url: service.url, state: service.state };
+    });
+
+    /*
+     * Header values are held back unless asked for, because a header is usually a key and a file
+     * is meant to be sendable. The names always go, so the file still says what is needed.
+     */
+    var names = [];
+    function collect(headers) {
+      (headers || []).forEach(function (header) {
+        if (header.name && names.indexOf(header.name) < 0) names.push(header.name);
+      });
+    }
+    collect(data.defaults.headers);
+    data.configs.forEach(function (config) { collect(config.headers); });
+
+    var secrets = null;
+    if (names.length) {
+      secrets = optionRow('checkbox', 'Include header values',
+        'The file will contain the values of ' + joinWords(names) + ' in plain text, so the board '
+        + 'works as soon as it is imported. Untick to write the names only, which is safer if the '
+        + 'file is going to somebody else.');
+      // On by default: an export is usually a backup, and one missing its credentials is not one.
+      secrets.input.checked = true;
+    }
+
+    pickList(rows, {
+      action: 'Export',
+      note: rows.length ? null : 'There is nothing on this board to export yet.',
+      extra: secrets ? [wrapOptions([secrets])] : null,
+      onGo: function (indexes, done) {
+        var ids = indexes.map(function (i) { return data.services[i].id; });
+        post('export', {
+          ids: ids,
+          includeHeaderValues: !!(secrets && secrets.input.checked)
+        }).then(function (reply) {
+          if (reply.message) return done(reply.message);
+          done('');
+          // A cancelled panel says nothing and leaves the form alone.
+          if (reply.saved) {
+            notice('Exported ' + ids.length + ' to ' + reply.saved);
+            select(null);
+          }
+        });
+      }
+    });
+  }
+
+  function paintImport(preview) {
+    document.getElementById('title').textContent = 'Import';
+    document.getElementById('subtitle').textContent =
+      'From ' + (preview.boardName || 'a board file') + '. Nothing is added until you say so.';
+    document.getElementById('check').hidden = true;
+
+    var room = data.capacity - data.total;
+    var rows = preview.services.map(function (service, i) {
+      return { name: service.name, url: service.url, disabled: i >= room };
+    });
+
+    var warning = null;
+    if (preview.overCapacity > 0) {
+      warning = 'This board has room for ' + room + ' more, so '
+        + preview.overCapacity + ' cannot be added.';
+    }
+
+    /*
+     * A service that overrides nothing is checked the way its board says, so the same service can
+     * behave differently once imported. The differences are shown and the choice is offered here,
+     * because this is the only point at which both boards are known.
+     */
+    var extra = null;
+    var keep = null;
+    if (preview.differences.length) {
+      var pinnable = preview.differences.filter(function (d) { return d.pinnable; });
+      var labels = pinnable.map(function (d) { return d.label; });
+      extra = [diffTable(preview.differences)];
+      if (pinnable.length) {
+        var follow = optionRow('radio', 'Follow this board',
+          'Imported services are checked the way everything else on this board is.');
+        keep = optionRow('radio', 'Keep the file\\'s values',
+          'Gives the imported services the file\\'s ' + joinWords(labels) + ', so they are '
+          + 'checked the way they were before. Everything else still follows this board.');
+        follow.input.name = 'defaults';
+        keep.input.name = 'defaults';
+        follow.input.checked = true;
+        // Radios in one group: the browser unchecks the other, but the drawn box is ours.
+        var repaint = function () { follow.paint(); keep.paint(); };
+        follow.input.addEventListener('change', repaint);
+        keep.input.addEventListener('change', repaint);
+        extra.push(wrapOptions([follow, keep]));
+      }
+    }
+
+    var notes = [];
+    var frequency = preview.differences.filter(function (d) { return d.key === 'checkFrequency'; });
+    if (frequency.length) {
+      notes.push('The whole board checks on one schedule, so these will be checked '
+        + frequency[0].to + (keep ? ' whichever you choose.' : ' like the rest of the board.'));
+    }
+    if (preview.needsHeaderValues.length) {
+      notes.push('This file lists ' + joinWords(preview.needsHeaderValues)
+        + ' with no value. Fill those in on each service after importing, or its checks will '
+        + 'fail.');
+    }
+
+    pickList(rows, {
+      action: 'Import',
+      note: notes.length ? notes.join(' ') : null,
+      warning: warning,
+      extra: extra,
+      onGo: function (indexes, done) {
+        post('import-confirm', {
+          indexes: indexes,
+          pin: !!(keep && keep.input.checked)
+        }).then(function (reply) {
+          if (reply.message) return done(reply.message);
+          done('');
+          apply(reply.data);
+          notice('Imported ' + (reply.added || 0));
+          select(null);
+        });
+      }
+    });
+  }
+
   function paintDetail() {
+    /*
+     * Hidden rather than disabled when there is nothing to check.
+     *
+     * The forms and the pickers already hide it, so it is a control that appears where it
+     * applies, not a fixture. On an empty board the view is one instruction, and a greyed out
+     * button beside it is a second thing to read that leads nowhere.
+     */
     var check = document.getElementById('check');
-    check.hidden = false;
+    check.hidden = data.total === 0;
     if (view === 'add' || view === 'edit') paintForm(view === 'edit' ? selected : null);
     else if (view === 'settings') paintSettings();
+    else if (view === 'export') paintExport();
+    else if (view === 'import') paintImport(importPreview);
     else if (selected === null) paintAll();
     else paintService(selected);
   }
@@ -1780,9 +2301,26 @@ export function renderBoardHtml(
     });
   }
 
+  /** A one-off message in the footer, for something that has already happened. */
+  var transientNotice = null;
+  function notice(text) {
+    transientNotice = text;
+    paintNotice();
+    setTimeout(function () {
+      if (transientNotice !== text) return;
+      transientNotice = null;
+      paintNotice();
+    }, 6000);
+  }
+
   function paintNotice() {
     var notice = document.getElementById('notice');
     notice.textContent = '';
+    if (transientNotice) {
+      notice.hidden = false;
+      notice.appendChild(el('span', null, transientNotice));
+      return;
+    }
     if (!data.undo) { notice.hidden = true; return; }
     notice.hidden = false;
     notice.appendChild(el('span', null, 'Deleted ' + data.undo + '.'));
@@ -1849,6 +2387,7 @@ export function renderBoardHtml(
     var button = document.getElementById('check');
     var label = document.getElementById('check-label');
     button.disabled = true;
+    button.classList.add('checking');
     label.textContent = 'Checking…';
     var request = selected === null
       ? post('check-all')
@@ -1857,7 +2396,8 @@ export function renderBoardHtml(
       apply(reply.data);
     }).then(function () {
       checking = false;
-      button.disabled = false;
+      button.disabled = data.total === 0;
+      button.classList.remove('checking');
       label.textContent = selected === null ? 'Check all' : 'Check now';
     });
   }
@@ -1876,6 +2416,20 @@ export function renderBoardHtml(
     show('add');
   });
   document.getElementById('settings').addEventListener('click', function () { show('settings'); });
+  document.getElementById('export').addEventListener('click', function () {
+    if (!data.total) return;
+    show('export');
+  });
+  document.getElementById('import').addEventListener('click', guard('import', function () {
+    // The panel is the plugin's to open, so the click asks and waits. A cancelled panel comes
+    // back with nothing and leaves the view alone.
+    post('import-open').then(function (reply) {
+      if (reply.message) { notice(reply.message); return; }
+      if (!reply.preview) return;
+      importPreview = reply.preview;
+      show('import');
+    });
+  }));
 
   /** Whether the keystroke belongs to a field the user is typing in. */
   function isTyping(e) {
@@ -2017,6 +2571,27 @@ export async function showBoardWindow(
           await options.onMoveService(message.id, { delta: message.delta });
           return { data: options.getOverview() };
         }
+      }
+
+      if (message.type === "export" && Array.isArray(message.ids) && options.onExport) {
+        const ids = message.ids.filter((id): id is string => typeof id === "string");
+        const path = await options.onExport(ids, {
+          includeHeaderValues: message.includeHeaderValues === true,
+        });
+        // A cancelled save panel is a normal outcome and gets no message.
+        return path ? { saved: path } : {};
+      }
+
+      if (message.type === "import-open" && options.onImportOpen) {
+        const preview = await options.onImportOpen();
+        return preview ? { preview } : {};
+      }
+
+      if (message.type === "import-confirm"
+        && Array.isArray(message.indexes) && options.onImportConfirm) {
+        const indexes = message.indexes.filter((i): i is number => typeof i === "number");
+        const result = await options.onImportConfirm(indexes, { pin: message.pin === true });
+        return { data: options.getOverview(), ...result };
       }
 
       if (message.type === "update-board" && options.onUpdateBoard) {
